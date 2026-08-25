@@ -13,6 +13,7 @@ An autonomous C++ Code Review Agent built with **LangGraph**, **Ollama**, and **
    - **`clangd-query`**: Semantic AST code intelligence (`search`, `show`, `usages`, `hierarchy`, `signature`, `interface`).
    - **`ripgrep` (`rg`)**: High-performance regex text search for memory management keywords (`malloc`, `free`, `new`, `delete`, `strcpy`), concurrency primitives, and raw pointer patterns.
    - **`read_project_file`**: Context-bounded file reader for build configurations and source files.
+   - **`record_finding`**: Incremental review findings recorder that writes observations step-by-step into persistent state and `.draft_review_findings.json` as exploration happens (ideal for scaling to 50+ files without context memory limits).
 3. **Multi-Model Support**:
    - **Ollama**: Run offline/locally with models such as `llama3.1:8b`, `qwen2.5:14b`, `qwen2.5:32b`, `qwen3.6:27b`.
    - **Google Gemini API**: Seamless fallback/testing mode using `gemini-2.5-flash` or `gemini-1.5-pro` when local GPU/Ollama is not available.

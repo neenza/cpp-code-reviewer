@@ -232,8 +232,68 @@ def read_project_file(
         return f"Error reading file '{file_path}': {e}"
 
 
+# Global findings storage for incremental report construction
+_RECORDED_FINDINGS: List[Dict[str, Any]] = []
+
+
+def reset_findings() -> None:
+    """Reset the recorded findings store for a new review run."""
+    global _RECORDED_FINDINGS
+    _RECORDED_FINDINGS = []
+
+
+@tool
+def record_finding(
+    category: Literal["architecture", "exceptional", "minor_improvement", "critical_flaw"],
+    title: str,
+    details: str,
+    files_and_lines: str,
+    recommended_fix: Optional[str] = None
+) -> str:
+    """Record an incremental code review finding immediately during exploration.
+    Call this tool whenever you discover an architectural element, an exceptional implementation,
+    a minor improvement, or a critical flaw.
+    
+    Args:
+      category: 'architecture', 'exceptional', 'minor_improvement', or 'critical_flaw'
+      title: Short descriptive headline (e.g. 'Buffer Overflow in SessionManager::create_session')
+      details: Deep analysis explaining the rationale, impact, or idiom
+      files_and_lines: Specific file paths and line ranges (e.g. 'src/session_manager.cpp:15-25')
+      recommended_fix: Code snippet or exact guidance for resolving flaws
+    """
+    global _RECORDED_FINDINGS, _ACTIVE_PROJECT_DIR
+
+    entry = {
+        "category": category,
+        "title": title,
+        "details": details,
+        "files_and_lines": files_and_lines,
+        "recommended_fix": recommended_fix or "",
+        "timestamp": time.time()
+    }
+    _RECORDED_FINDINGS.append(entry)
+
+    # Save to incremental draft file on disk immediately
+    draft_file = _ACTIVE_PROJECT_DIR / ".draft_review_findings.json"
+    try:
+        with open(draft_file, "w", encoding="utf-8") as f:
+            json.dump(_RECORDED_FINDINGS, f, indent=2)
+    except Exception:
+        pass
+
+    cat_badge = {
+        "architecture": "[blue]ARCHITECTURE[/blue]",
+        "exceptional": "[green]EXCEPTIONAL[/green]",
+        "minor_improvement": "[yellow]MINOR IMPROVEMENT[/yellow]",
+        "critical_flaw": "[red]CRITICAL FLAW[/red]"
+    }.get(category, category.upper())
+
+    console.print(f"  [bold]📝 Recorded Finding ({cat_badge}):[/bold] {title} ({files_and_lines})")
+    return f"Successfully recorded finding [{category.upper()}]: '{title}'. Total findings recorded: {len(_RECORDED_FINDINGS)}"
+
+
 # List of all available tools
-TOOLS = [clangd_query, ripgrep_search, read_project_file]
+TOOLS = [clangd_query, ripgrep_search, read_project_file, record_finding]
 
 
 # ============================================================================
@@ -281,49 +341,51 @@ def get_llm(provider: str, model_name: str, ollama_host: str = "http://localhost
 
 SYSTEM_PROMPT = """You are an expert autonomous C++ Code Review Agent specializing in modern C++ (C++17/C++20/C++23), systems programming, concurrency, memory safety, and software architecture.
 
-Your workflow MUST be systematic and thorough:
-1. **Analyze CMakeLists.txt**: Start by reading and analyzing `CMakeLists.txt` using `read_project_file` to understand targets, libraries, include directories, C++ standards, and external dependencies.
-2. **Systematic Code Exploration**:
-   - Use `clangd_query` (commands: `search`, `show`, `usages`, `hierarchy`, `signature`, `interface`) to semantically explore classes, inheritance hierarchies, member functions, signatures, and public APIs.
-   - Use `ripgrep_search` to audit for memory safety patterns (`malloc`, `free`, `new`, `delete`, `strcpy`, `raw pointers`), thread synchronization primitives (`std::mutex`, `std::shared_mutex`, `std::atomic`), and resource management.
-   - Systematically trace dependencies across all header and source files.
+Your workflow MUST be systematic, incremental, and thorough:
+1. **Analyze CMakeLists.txt**: Start by reading and analyzing `CMakeLists.txt` using `read_project_file`. Call `record_finding` with category='architecture' for project configuration.
+2. **Systematic Code Exploration & Incremental Recording**:
+   - Use `clangd_query` (`search`, `show`, `usages`, `hierarchy`, `signature`, `interface`) to semantically explore symbols.
+   - Use `ripgrep_search` to audit memory management (`malloc`, `free`, `new`, `delete`, `strcpy`, raw pointers) and concurrency (`shared_mutex`, `mutex`, `atomic`).
+   - **CRITICAL STEP**: As soon as you spot an exceptional practice, a minor improvement, or a critical flaw, call `record_finding` immediately to log it into the report scratchpad. Do not wait until the end!
 3. **Synthesis & Detailed Report**:
-   When your investigation is complete, provide a comprehensive, actionable Code Review Report with the following exact markdown sections:
+   When your investigation is complete, synthesize your recorded findings into the comprehensive 4-part Code Review Report:
 
 # Comprehensive C++ Code Review Report
 
 ## 1. Project Architecture & Dependency Overview
-- Build configuration, C++ standard, target structures, and component relationships.
-
 ## 2. What Is Implemented Exceptionally Well
-- Detailed analysis of well-architected components, modern C++ idiom usage (e.g. RAII, rule of 0/5, move semantics, smart pointers, thread-safety with `std::shared_mutex`, `noexcept`, `[[nodiscard]]`, `std::optional`, const-correctness).
-
 ## 3. What Needs Minor Improvements
-- Code style, non-critical design enhancements, pass-by-value copies that could use move/const-ref, missing `virtual` destructor on interfaces, hardcoded magic numbers, unbounded collection growth, or improved error handling.
-
-## 4. What Is Poorly Implemented or Contains Critical Flaws
-- Critical issues with high severity:
-  - **Memory Safety**: Double-free, Use-After-Free (UAF), raw pointer ownership mismanagement, dangling pointers, Rule of 3/5 violations.
-  - **Buffer Overflows / Security**: Unsafe C-string functions (`strcpy`, `sprintf`) without bounds checks.
-  - **Concurrency & Data Races**: Shared mutable state accessed across threads without synchronization.
-  - **Undefined Behavior (UB)** / Resource Leaks.
-- Provide concrete code examples and exact recommended fixes for each critical flaw.
-
-Be rigorous, precise, cite specific files and lines, and provide constructive, production-grade recommendations.
+## 4. What Is Poorly Implemented or Contains Critical Flaws (with code fixes)
 """
 
 
+import time
+import re
+
 def build_code_review_graph(llm, tools=TOOLS):
     """
-    Build and compile the LangGraph ReAct agent graph.
+    Build and compile the LangGraph ReAct agent graph with automatic rate limit retry.
     """
     llm_with_tools = llm.bind_tools(tools)
 
     def agent_node(state: MessagesState) -> Dict[str, Any]:
         """Agent reasoning node that calls LLM with available messages and tools."""
         messages = state["messages"]
-        response = llm_with_tools.invoke(messages)
-        return {"messages": [response]}
+        max_retries = 5
+        base_delay = 6
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = llm_with_tools.invoke(messages)
+                return {"messages": [response]}
+            except Exception as e:
+                err_msg = str(e)
+                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
+                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
+                    wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
+                    console.print(f"[yellow]Rate limit reached (429). Waiting {wait_time:.1f}s before retrying (attempt {attempt}/{max_retries})...[/yellow]")
+                    time.sleep(wait_time)
+                else:
+                    raise e
 
     tool_node = ToolNode(tools)
 
@@ -337,6 +399,28 @@ def build_code_review_graph(llm, tools=TOOLS):
     workflow.add_edge("tools", "agent")
 
     return workflow.compile()
+
+
+def extract_text(content: Any) -> str:
+    """Extract plain string content from string, list of parts, or structured objects."""
+    if isinstance(content, str):
+        return content
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+            elif hasattr(item, "text"):
+                parts.append(str(getattr(item, "text", "")))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    elif content is None:
+        return ""
+    else:
+        return str(content)
 
 
 # ============================================================================
@@ -361,20 +445,21 @@ def run_code_review(
 
     set_active_project_dir(proj_path)
     ensure_compile_commands(proj_path)
+    reset_findings()
 
     # Determine default model name if not specified
     if not model_name:
         if provider.lower() == "ollama":
             model_name = "llama3.1:8b"
         else:
-            model_name = "gemini-2.5-flash"
+            model_name = "gemini-3.5-flash-lite"
 
     console.print(Panel(
         f"[bold cyan]Autonomous C++ Code Review Agent[/bold cyan]\n"
         f"Project Path : [yellow]{proj_path}[/yellow]\n"
         f"Provider     : [green]{provider}[/green]\n"
         f"Model        : [green]{model_name}[/green]\n"
-        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file[/blue]",
+        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, record_finding[/blue]",
         title="Agent Configuration",
         border_style="cyan"
     ))
@@ -410,13 +495,16 @@ def run_code_review(
                 if message.tool_calls:
                     for tc in message.tool_calls:
                         console.print(f"[bold magenta]▶ Tool Call ({step_count}):[/bold magenta] [cyan]{tc['name']}[/cyan]({json.dumps(tc['args'])})")
-                elif message.content:
-                    final_response_text = message.content
-                    console.print(f"\n[bold green]✔ Agent Concluded Review ({step_count} steps)[/bold green]\n")
+                else:
+                    text_content = extract_text(message.content)
+                    if text_content:
+                        final_response_text = text_content
+                        console.print(f"\n[bold green]✔ Agent Concluded Review ({step_count} steps)[/bold green]\n")
             elif node_name == "tools":
                 for msg in node_update["messages"]:
-                    content_preview = msg.content[:160].replace("\n", " ")
-                    if len(msg.content) > 160:
+                    raw_text = extract_text(msg.content)
+                    content_preview = raw_text[:160].replace("\n", " ")
+                    if len(raw_text) > 160:
                         content_preview += "..."
                     console.print(f"[dim]  ↳ Tool Result: {content_preview}[/dim]")
 

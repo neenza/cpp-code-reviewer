@@ -45,6 +45,18 @@ class TestCodeReviewTools(unittest.TestCase):
         res = clangd_query.invoke({"command": "hierarchy", "symbol_or_query": "StripeGateway"})
         self.assertIn("IPaymentGateway", res)
 
+    def test_record_finding(self):
+        from code_review_agent import record_finding, _RECORDED_FINDINGS
+        res = record_finding.invoke({
+            "category": "critical_flaw",
+            "title": "Buffer overflow in SessionManager",
+            "details": "strcpy without bounds check",
+            "files_and_lines": "src/session_manager.cpp:18",
+            "recommended_fix": "Use std::string or snprintf"
+        })
+        self.assertIn("CRITICAL_FLAW", res)
+        self.assertTrue(any(f["title"] == "Buffer overflow in SessionManager" for f in _RECORDED_FINDINGS))
+
     def test_langgraph_compilation(self):
         class DummyLLM:
             def bind_tools(self, tools):
