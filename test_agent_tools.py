@@ -46,7 +46,7 @@ class TestCodeReviewTools(unittest.TestCase):
         self.assertIn("IPaymentGateway", res)
 
     def test_record_finding(self):
-        from code_review_agent import record_finding, _RECORDED_FINDINGS
+        from code_review_agent import record_finding, list_project_source_files, _RECORDED_FINDINGS
         res = record_finding.invoke({
             "category": "critical_flaw",
             "title": "Buffer overflow in SessionManager",
@@ -56,6 +56,10 @@ class TestCodeReviewTools(unittest.TestCase):
         })
         self.assertIn("CRITICAL_FLAW", res)
         self.assertTrue(any(f["title"] == "Buffer overflow in SessionManager" for f in _RECORDED_FINDINGS))
+
+        file_list = list_project_source_files.invoke({})
+        self.assertIn("order_repository.cpp", file_list)
+        self.assertIn("session_manager.h", file_list)
 
     def test_langgraph_compilation(self):
         class DummyLLM:

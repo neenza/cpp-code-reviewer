@@ -232,6 +232,29 @@ def read_project_file(
         return f"Error reading file '{file_path}': {e}"
 
 
+@tool
+def list_project_source_files() -> str:
+    """Scan and return all C++ header (.h, .hpp) and source (.cpp, .cc, .cxx) files in the project.
+    Use this to build an exhaustive checklist of files declared in CMakeLists.txt and verify every file is audited.
+    """
+    global _ACTIVE_PROJECT_DIR
+    headers = []
+    sources = []
+    for ext in ["*.h", "*.hpp", "*.hxx"]:
+        headers.extend(sorted(_ACTIVE_PROJECT_DIR.glob(f"**/{ext}")))
+    for ext in ["*.cpp", "*.cc", "*.cxx", "*.c"]:
+        sources.extend(sorted(_ACTIVE_PROJECT_DIR.glob(f"**/{ext}")))
+
+    # Filter out build and .cache directories
+    headers = [str(p.relative_to(_ACTIVE_PROJECT_DIR)) for p in headers if "build" not in p.parts and ".cache" not in p.parts]
+    sources = [str(p.relative_to(_ACTIVE_PROJECT_DIR)) for p in sources if "build" not in p.parts and ".cache" not in p.parts]
+
+    output = f"Discovered {len(headers)} header(s) and {len(sources)} source file(s):\n"
+    output += "Headers:\n" + ("\n".join(f"  - {h}" for h in headers) if headers else "  (None)") + "\n"
+    output += "Sources:\n" + ("\n".join(f"  - {s}" for s in sources) if sources else "  (None)")
+    return output
+
+
 # Global findings storage for incremental report construction
 _RECORDED_FINDINGS: List[Dict[str, Any]] = []
 
@@ -293,7 +316,7 @@ def record_finding(
 
 
 # List of all available tools
-TOOLS = [clangd_query, ripgrep_search, read_project_file, record_finding]
+TOOLS = [clangd_query, ripgrep_search, read_project_file, list_project_source_files, record_finding]
 
 
 # ============================================================================
@@ -341,21 +364,22 @@ def get_llm(provider: str, model_name: str, ollama_host: str = "http://localhost
 
 SYSTEM_PROMPT = """You are an expert autonomous C++ Code Review Agent specializing in modern C++ (C++17/C++20/C++23), systems programming, concurrency, memory safety, and software architecture.
 
-Your workflow MUST be systematic, incremental, and thorough:
-1. **Analyze CMakeLists.txt**: Start by reading and analyzing `CMakeLists.txt` using `read_project_file`. Call `record_finding` with category='architecture' for project configuration.
-2. **Systematic Code Exploration & Incremental Recording**:
-   - Use `clangd_query` (`search`, `show`, `usages`, `hierarchy`, `signature`, `interface`) to semantically explore symbols.
-   - Use `ripgrep_search` to audit memory management (`malloc`, `free`, `new`, `delete`, `strcpy`, raw pointers) and concurrency (`shared_mutex`, `mutex`, `atomic`).
-   - **CRITICAL STEP**: As soon as you spot an exceptional practice, a minor improvement, or a critical flaw, call `record_finding` immediately to log it into the report scratchpad. Do not wait until the end!
+Your workflow MUST be systematic, exhaustive, incremental, and thorough:
+1. **Analyze CMakeLists.txt & Build Source Checklist**:
+   - Read `CMakeLists.txt` using `read_project_file`.
+   - Call `list_project_source_files` to obtain the complete checklist of all header and source files in the project (including all sources under `set()`, `add_library()`, `add_executable()`, and `include_directories()`).
+   - Call `record_finding` with category='architecture' to record the project structure and build targets.
+2. **Exhaustive File & Symbol Exploration**:
+   - Systematically inspect EVERY file discovered in step 1. Do not skip any file.
+   - For each class/struct/function, use `clangd_query` (`show`, `interface`, `hierarchy`, `signature`, `usages`) to semantically inspect declarations and definitions.
+   - Use `ripgrep_search` to audit memory safety (`malloc`, `free`, `new`, `delete`, `strcpy`, raw pointers) and concurrency (`shared_mutex`, `mutex`, `atomic`).
+   - **INCREMENTAL RECORDING**: As soon as you identify an exceptional practice, a minor improvement, or a critical flaw in any file, call `record_finding` immediately.
 3. **Synthesis & Detailed Report**:
-   When your investigation is complete, synthesize your recorded findings into the comprehensive 4-part Code Review Report:
-
-# Comprehensive C++ Code Review Report
-
-## 1. Project Architecture & Dependency Overview
-## 2. What Is Implemented Exceptionally Well
-## 3. What Needs Minor Improvements
-## 4. What Is Poorly Implemented or Contains Critical Flaws (with code fixes)
+   Synthesize all findings into the 4-part Code Review Report covering:
+   - ## 1. Project Architecture & Dependency Overview
+   - ## 2. What Is Implemented Exceptionally Well
+   - ## 3. What Needs Minor Improvements
+   - ## 4. What Is Poorly Implemented or Contains Critical Flaws (with code fixes)
 """
 
 
@@ -423,6 +447,74 @@ def extract_text(content: Any) -> str:
         return str(content)
 
 
+def synthesize_final_report(findings: List[Dict[str, Any]], fallback_text: str, project_dir: Path) -> str:
+    """
+    Ensure a complete, rich Markdown report is always generated,
+    combining LLM summary with structured findings from memory/disk.
+    """
+    if fallback_text and len(fallback_text.strip()) > 300 and "## " in fallback_text:
+        return fallback_text
+
+    # If fallback text was empty or truncated, recover from findings
+    if not findings:
+        draft_file = project_dir / ".draft_review_findings.json"
+        if draft_file.exists():
+            try:
+                with open(draft_file, "r", encoding="utf-8") as f:
+                    findings = json.load(f)
+            except Exception:
+                pass
+
+    if findings:
+        console.print("[cyan]Assembling comprehensive report from recorded findings...[/cyan]")
+        arch = [f for f in findings if f.get("category") == "architecture"]
+        exceptional = [f for f in findings if f.get("category") == "exceptional"]
+        minor = [f for f in findings if f.get("category") == "minor_improvement"]
+        critical = [f for f in findings if f.get("category") == "critical_flaw"]
+
+        sections = ["# Comprehensive C++ Code Review Report\n"]
+
+        # Section 1
+        sections.append("## 1. Project Architecture & Dependency Overview")
+        if arch:
+            for item in arch:
+                sections.append(f"### {item['title']}\n- **Files**: `{item['files_and_lines']}`\n\n{item['details']}\n")
+        else:
+            sections.append("Analysis of project build targets, include paths, and component structure.\n")
+
+        # Section 2
+        sections.append("## 2. What Is Implemented Exceptionally Well")
+        if exceptional:
+            for item in exceptional:
+                sections.append(f"### {item['title']}\n- **Files**: `{item['files_and_lines']}`\n\n{item['details']}\n")
+        else:
+            sections.append("No exceptional patterns specifically recorded.\n")
+
+        # Section 3
+        sections.append("## 3. What Needs Minor Improvements")
+        if minor:
+            for item in minor:
+                sections.append(f"### {item['title']}\n- **Files**: `{item['files_and_lines']}`\n\n{item['details']}")
+                if item.get("recommended_fix"):
+                    sections.append(f"\n**Recommended Improvement:**\n```cpp\n{item['recommended_fix']}\n```\n")
+        else:
+            sections.append("No minor improvements noted.\n")
+
+        # Section 4
+        sections.append("## 4. What Is Poorly Implemented or Contains Critical Flaws")
+        if critical:
+            for item in critical:
+                sections.append(f"### ⚠️ {item['title']}\n- **Files**: `{item['files_and_lines']}`\n\n{item['details']}")
+                if item.get("recommended_fix"):
+                    sections.append(f"\n**Recommended Fix:**\n```cpp\n{item['recommended_fix']}\n```\n")
+        else:
+            sections.append("No critical flaws detected.\n")
+
+        return "\n".join(sections)
+
+    return fallback_text or "# Comprehensive C++ Code Review Report\n\nReview concluded."
+
+
 # ============================================================================
 # Main Execution Runner
 # ============================================================================
@@ -433,7 +525,7 @@ def run_code_review(
     model_name: Optional[str] = None,
     ollama_host: str = "http://localhost:11434",
     output_report_path: Optional[str] = None,
-    max_steps: int = 30
+    max_steps: int = 45
 ) -> str:
     """
     Execute the autonomous C++ code review agent loop.
@@ -459,7 +551,7 @@ def run_code_review(
         f"Project Path : [yellow]{proj_path}[/yellow]\n"
         f"Provider     : [green]{provider}[/green]\n"
         f"Model        : [green]{model_name}[/green]\n"
-        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, record_finding[/blue]",
+        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, list_project_source_files, record_finding[/blue]",
         title="Agent Configuration",
         border_style="cyan"
     ))
@@ -469,9 +561,10 @@ def run_code_review(
 
     initial_prompt = (
         f"Please begin an autonomous comprehensive C++ code review for the project located at '{proj_path}'.\n"
-        f"Start by reading and analyzing CMakeLists.txt to understand the architecture and dependencies, "
-        f"then systematically explore the symbols and files using clangd_query and ripgrep_search. "
-        f"Conclude with the comprehensive 4-part Code Review Report."
+        f"1. Read and analyze CMakeLists.txt and record architecture findings with record_finding.\n"
+        f"2. Systematically explore the symbols and files using clangd_query and ripgrep_search.\n"
+        f"3. Record all exceptional patterns, minor improvements, and critical flaws with record_finding as you find them.\n"
+        f"4. Conclude with the full 4-part Code Review Report."
     )
 
     initial_state: MessagesState = {
@@ -492,11 +585,14 @@ def run_code_review(
         for node_name, node_update in step.items():
             if node_name == "agent":
                 message = node_update["messages"][-1]
+                text_content = extract_text(message.content)
+                if text_content and len(text_content.strip()) > 100:
+                    final_response_text = text_content
+
                 if message.tool_calls:
                     for tc in message.tool_calls:
                         console.print(f"[bold magenta]▶ Tool Call ({step_count}):[/bold magenta] [cyan]{tc['name']}[/cyan]({json.dumps(tc['args'])})")
                 else:
-                    text_content = extract_text(message.content)
                     if text_content:
                         final_response_text = text_content
                         console.print(f"\n[bold green]✔ Agent Concluded Review ({step_count} steps)[/bold green]\n")
@@ -508,13 +604,13 @@ def run_code_review(
                         content_preview += "..."
                     console.print(f"[dim]  ↳ Tool Result: {content_preview}[/dim]")
 
-    if not final_response_text:
-        final_response_text = "Review process concluded without generating final text."
+    # Build or enhance final report
+    final_report = synthesize_final_report(_RECORDED_FINDINGS, final_response_text, proj_path)
 
     # Print markdown report
     console.print("\n" + "="*80)
     console.print(Panel("[bold green]Generated Code Review Report[/bold green]", border_style="green"))
-    console.print(Markdown(final_response_text))
+    console.print(Markdown(final_report))
     console.print("="*80 + "\n")
 
     # Save report to file
@@ -524,10 +620,10 @@ def run_code_review(
         out_file = proj_path / "CPP_CODE_REVIEW_REPORT.md"
 
     with open(out_file, "w", encoding="utf-8") as f:
-        f.write(final_response_text)
+        f.write(final_report)
 
     console.print(f"[bold green]Report saved to:[/bold green] [cyan]{out_file}[/cyan]\n")
-    return final_response_text
+    return final_report
 
 
 def parse_args():
@@ -551,7 +647,7 @@ def parse_args():
         "--model", "-m",
         type=str,
         default=None,
-        help="Model name (e.g. 'gemini-2.5-flash', 'llama3.1:8b', 'qwen2.5:14b', 'qwen3.6:27b')"
+        help="Model name (e.g. 'gemini-3.5-flash-lite', 'llama3.1:8b', 'qwen2.5:14b', 'qwen3.6:27b')"
     )
     parser.add_argument(
         "--ollama-host",
@@ -568,8 +664,8 @@ def parse_args():
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=30,
-        help="Maximum LangGraph execution recursion steps (default: 30)"
+        default=45,
+        help="Maximum LangGraph execution recursion steps (default: 45)"
     )
     return parser.parse_args()
 
