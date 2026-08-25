@@ -1,0 +1,26 @@
+[
+{
+  "directory": "/root/Projects/codereviewagent/sample_project/build",
+  "command": "/data/data/com.termux/files/usr/bin/c++  -I/root/Projects/codereviewagent/sample_project/include -std=gnu++17 -o CMakeFiles/orders_lib.dir/src/order_repository.cpp.o -c /root/Projects/codereviewagent/sample_project/src/order_repository.cpp",
+  "file": "/root/Projects/codereviewagent/sample_project/src/order_repository.cpp",
+  "output": "CMakeFiles/orders_lib.dir/src/order_repository.cpp.o"
+},
+{
+  "directory": "/root/Projects/codereviewagent/sample_project/build",
+  "command": "/data/data/com.termux/files/usr/bin/c++  -I/root/Projects/codereviewagent/sample_project/include -std=gnu++17 -o CMakeFiles/orders_lib.dir/src/session_manager.cpp.o -c /root/Projects/codereviewagent/sample_project/src/session_manager.cpp",
+  "file": "/root/Projects/codereviewagent/sample_project/src/session_manager.cpp",
+  "output": "CMakeFiles/orders_lib.dir/src/session_manager.cpp.o"
+},
+{
+  "directory": "/root/Projects/codereviewagent/sample_project/build",
+  "command": "/data/data/com.termux/files/usr/bin/c++  -I/root/Projects/codereviewagent/sample_project/include -std=gnu++17 -o CMakeFiles/orders_lib.dir/src/payment_processor.cpp.o -c /root/Projects/codereviewagent/sample_project/src/payment_processor.cpp",
+  "file": "/root/Projects/codereviewagent/sample_project/src/payment_processor.cpp",
+  "output": "CMakeFiles/orders_lib.dir/src/payment_processor.cpp.o"
+},
+{
+  "directory": "/root/Projects/codereviewagent/sample_project/build",
+  "command": "/data/data/com.termux/files/usr/bin/c++  -I/root/Projects/codereviewagent/sample_project/include -std=gnu++17 -o CMakeFiles/order_server.dir/src/main.cpp.o -c /root/Projects/codereviewagent/sample_project/src/main.cpp",
+  "file": "/root/Projects/codereviewagent/sample_project/src/main.cpp",
+  "output": "CMakeFiles/order_server.dir/src/main.cpp.o"
+}
+]
