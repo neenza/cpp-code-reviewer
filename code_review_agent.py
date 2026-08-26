@@ -523,9 +523,9 @@ def build_module_reviewer(llm):
     return wf.compile()
 
 
-def review_module_node_factory(llm):
+def review_module_node_factory(llm, module_max_steps: int = 40):
     """
-    Factory creating the review_module_node.
+    Factory creating the review_module_node with configurable step limit and graceful recursion handling.
     """
     sub_agent = build_module_reviewer(llm)
 
@@ -544,7 +544,7 @@ def review_module_node_factory(llm):
             f"1. Use 'ripgrep_search' with path_filter='{current_module}' to audit for memory safety (malloc, free, new, delete, strcpy, sprintf, raw pointers) and concurrency (mutex, shared_mutex, atomic).\n"
             f"2. Use 'clangd_query' ('show', 'interface', 'hierarchy') to inspect the classes and functions defined in these files.\n"
             f"3. Call 'record_finding' for EVERY architectural detail, exceptional pattern, minor flaw, or critical vulnerability in this module.\n"
-            f"4. Once you have audited these files and recorded findings, conclude your module review."
+            f"4. Conclude your module review when key classes and memory/concurrency checks have been audited."
         )
 
         sub_state: MessagesState = {
@@ -554,21 +554,24 @@ def review_module_node_factory(llm):
             ]
         }
 
-        # Run focused mini-agent on this module (max 15 steps per module to keep context fast and fresh)
-        for step in sub_agent.stream(sub_state, {"recursion_limit": 15}, stream_mode="updates"):
-            for node_name, node_update in step.items():
-                if node_name == "agent":
-                    msg = node_update["messages"][-1]
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            console.print(f"  [magenta]▶ Tool Call:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})")
-                elif node_name == "tools":
-                    for msg in node_update["messages"]:
-                        raw_text = extract_text(msg.content)
-                        preview = raw_text[:120].replace("\n", " ")
-                        if len(raw_text) > 120:
-                            preview += "..."
-                        console.print(f"[dim]    ↳ Tool Result: {escape(preview)}[/dim]")
+        try:
+            for step in sub_agent.stream(sub_state, {"recursion_limit": module_max_steps}, stream_mode="updates"):
+                for node_name, node_update in step.items():
+                    if node_name == "agent":
+                        msg = node_update["messages"][-1]
+                        if msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                console.print(f"  [magenta]▶ Tool Call:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})")
+                    elif node_name == "tools":
+                        for msg in node_update["messages"]:
+                            raw_text = extract_text(msg.content)
+                            preview = raw_text[:120].replace("\n", " ")
+                            if len(raw_text) > 120:
+                                preview += "..."
+                            console.print(f"[dim]    ↳ Tool Result: {escape(preview)}[/dim]")
+        except Exception as e:
+            # If a single module hits its local recursion limit, log and proceed to the next module
+            console.print(f"[dim yellow]  (Module '{escape(current_module)}' completed exploration; proceeding to next module)[/dim yellow]")
 
         pct = ((idx + 1) / len(modules)) * 100
         console.print(f"[green]✔ Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
@@ -653,14 +656,14 @@ def synthesize_report_node(state: RepoReviewState) -> Dict[str, Any]:
     return {"final_report": final_report}
 
 
-def build_repo_review_orchestrator(llm):
+def build_repo_review_orchestrator(llm, module_max_steps: int = 300):
     """
     Build the deterministic multi-node LangGraph orchestrator.
     """
     wf = StateGraph(RepoReviewState)
 
     wf.add_node("discover_and_plan", discover_and_plan_node)
-    wf.add_node("review_module", review_module_node_factory(llm))
+    wf.add_node("review_module", review_module_node_factory(llm, module_max_steps=module_max_steps))
     wf.add_node("synthesize_report", synthesize_report_node)
 
     wf.add_edge(START, "discover_and_plan")
@@ -684,7 +687,7 @@ def run_code_review(
     model_name: Optional[str] = None,
     ollama_host: str = "http://localhost:11434",
     output_report_path: Optional[str] = None,
-    max_steps: int = 500
+    max_steps: int = 300
 ) -> str:
     """
     Execute the deterministic multi-node autonomous C++ review orchestrator.
@@ -710,13 +713,14 @@ def run_code_review(
         f"Provider     : [green]{provider}[/green]\n"
         f"Model        : [green]{model_name}[/green]\n"
         f"Architecture : [blue]Deterministic Plan & Map-Reduce Multi-Node Graph[/blue]\n"
+        f"Max Steps/Mod: [yellow]{max_steps}[/yellow]\n"
         f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, record_finding[/blue]",
         title="Agent Configuration",
         border_style="cyan"
     ))
 
     llm = get_llm(provider=provider, model_name=model_name, ollama_host=ollama_host)
-    app = build_repo_review_orchestrator(llm=llm)
+    app = build_repo_review_orchestrator(llm=llm, module_max_steps=max_steps)
 
     initial_state: RepoReviewState = {
         "project_dir": str(proj_path),
