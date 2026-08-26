@@ -5,6 +5,6 @@
     "details": "strcpy without bounds check",
     "files_and_lines": "src/session_manager.cpp:18",
     "recommended_fix": "Use std::string or snprintf",
-    "timestamp": 1787748384.2311678
+    "timestamp": 1787749571.2321122
   }
 ]

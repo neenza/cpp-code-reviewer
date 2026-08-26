@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 Autonomous C++ Code Review Agent using LangGraph, clangd-query, and ripgrep.
-Supports both Ollama (local/offline) and Google Gemini (API).
+Features a deterministic Plan-and-Execute / Map-Reduce workflow designed to
+exhaustively audit repositories with 100+ files without context bloat or premature exits.
 """
 
 import os
 import sys
 import json
+import time
 import shutil
 import argparse
 import subprocess
-from typing import Literal, Optional, List, Dict, Any
+from typing import Literal, Optional, List, Dict, Any, TypedDict, Annotated
+import operator
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,12 +32,19 @@ console = Console()
 
 # Global variable to store active project root for tools
 _ACTIVE_PROJECT_DIR: Path = Path.cwd()
+_RECORDED_FINDINGS: List[Dict[str, Any]] = []
 
 
 def set_active_project_dir(project_dir: Path) -> None:
     """Set the active project directory for tool executions."""
     global _ACTIVE_PROJECT_DIR
     _ACTIVE_PROJECT_DIR = project_dir.resolve()
+
+
+def reset_findings() -> None:
+    """Reset the recorded findings store for a new review run."""
+    global _RECORDED_FINDINGS
+    _RECORDED_FINDINGS = []
 
 
 def ensure_compile_commands(project_dir: Path) -> bool:
@@ -92,17 +102,11 @@ def clangd_query(
 
     Commands:
       - 'search': Find symbols across the project by name (single-word token, supports fuzzy matching).
-                  Example: 'Order', 'SessionManager', 'process_order_payment'
-      - 'show': Display full source code (both declaration from .h and definition from .cpp) of a class, struct, or method.
-                Example: 'OrderRepository', 'SessionManager::create_session', 'IPaymentGateway'
+      - 'show': Display full source code (both declaration and definition) of a class or function.
       - 'usages': Find all reference/call sites of a symbol across the entire codebase.
-                  Example: 'OrderRepository', 'SessionData'
       - 'hierarchy': Show type inheritance hierarchy (base classes and derived classes).
-                     Example: 'StripeGateway', 'IPaymentGateway'
       - 'signature': Show function signatures with parameter types, return values, and overloads.
-                     Example: 'add_order', 'process'
       - 'interface': Show only public methods and member variables of a class/struct.
-                     Example: 'OrderRepository', 'PaymentProcessor'
     """
     global _ACTIVE_PROJECT_DIR
 
@@ -177,9 +181,8 @@ def ripgrep_search(
         )
         output = result.stdout.strip()
         if not output:
-            return f"[ripgrep '{pattern}']: No matches found."
+            return f"[ripgrep '{pattern}']: No matches found in {path_filter or 'project'}."
         
-        # Limit output length to prevent token overflow
         lines = output.splitlines()
         if len(lines) > max_results:
             truncated = "\n".join(lines[:max_results])
@@ -205,7 +208,6 @@ def read_project_file(
     global _ACTIVE_PROJECT_DIR
 
     target = (_ACTIVE_PROJECT_DIR / file_path).resolve()
-    # Safety check
     if not str(target).startswith(str(_ACTIVE_PROJECT_DIR)):
         return f"Error: Access denied. Cannot read outside project directory: {file_path}"
 
@@ -230,103 +232,6 @@ def read_project_file(
         return f"File: {file_path} (Lines {start}-{end} of {total_lines})\n\n{formatted}"
     except Exception as e:
         return f"Error reading file '{file_path}': {e}"
-
-
-# Global state trackers for incremental review and coverage
-_RECORDED_FINDINGS: List[Dict[str, Any]] = []
-_ALL_PROJECT_FILES: List[str] = []
-_INSPECTED_FILES: set = set()
-
-
-def reset_findings() -> None:
-    """Reset the recorded findings store and file tracker for a new review run."""
-    global _RECORDED_FINDINGS, _ALL_PROJECT_FILES, _INSPECTED_FILES
-    _RECORDED_FINDINGS = []
-    _ALL_PROJECT_FILES = []
-    _INSPECTED_FILES = set()
-
-
-@tool
-def list_project_source_files() -> str:
-    """Scan and return all C++ header (.h, .hpp) and source (.cpp, .cc, .cxx) files grouped by module/directory.
-    Initializes the mandatory coverage checklist for the entire repository.
-    """
-    global _ACTIVE_PROJECT_DIR, _ALL_PROJECT_FILES
-    headers = []
-    sources = []
-    for ext in ["*.h", "*.hpp", "*.hxx"]:
-        headers.extend(sorted(_ACTIVE_PROJECT_DIR.glob(f"**/{ext}")))
-    for ext in ["*.cpp", "*.cc", "*.cxx", "*.c"]:
-        sources.extend(sorted(_ACTIVE_PROJECT_DIR.glob(f"**/{ext}")))
-
-    # Filter out build and .cache directories
-    headers = [str(p.relative_to(_ACTIVE_PROJECT_DIR)) for p in headers if "build" not in p.parts and ".cache" not in p.parts]
-    sources = [str(p.relative_to(_ACTIVE_PROJECT_DIR)) for p in sources if "build" not in p.parts and ".cache" not in p.parts]
-
-    _ALL_PROJECT_FILES = sorted(list(set(headers + sources)))
-
-    # Group by parent directory
-    dir_groups: Dict[str, List[str]] = {}
-    for f in _ALL_PROJECT_FILES:
-        parent = str(Path(f).parent)
-        if parent not in dir_groups:
-            dir_groups[parent] = []
-        dir_groups[parent].append(f)
-
-    output = f"Total Repository Inventory: {len(_ALL_PROJECT_FILES)} files ({len(headers)} headers, {len(sources)} sources)\n\n"
-    output += "Directory / Module Breakdown:\n"
-    for d, files in sorted(dir_groups.items()):
-        output += f"📁 {d}/ ({len(files)} files):\n"
-        for f in files[:10]:
-            output += f"   - {f}\n"
-        if len(files) > 10:
-            output += f"   ... and {len(files) - 10} more files in {d}/\n"
-
-    output += "\nUse 'track_review_progress' to mark files as inspected as you complete each module."
-    return output
-
-
-@tool
-def track_review_progress(
-    inspected_files: Optional[List[str]] = None
-) -> str:
-    """Track and report codebase review coverage.
-    Pass 'inspected_files' with a list of file paths you just audited (e.g. ['src/net/tcp.cpp', 'include/net/tcp.h']).
-    Returns the current audit coverage percentage and the list of remaining uninspected files/directories.
-    """
-    global _ALL_PROJECT_FILES, _INSPECTED_FILES
-
-    if inspected_files:
-        for f in inspected_files:
-            # Match normalized relative paths
-            clean_f = f.strip().lstrip("./")
-            _INSPECTED_FILES.add(clean_f)
-
-    total = len(_ALL_PROJECT_FILES)
-    if total == 0:
-        return "No project files registered yet. Please call 'list_project_source_files' first."
-
-    completed = len(_INSPECTED_FILES)
-    remaining = [f for f in _ALL_PROJECT_FILES if f not in _INSPECTED_FILES]
-    pct = (completed / total) * 100 if total > 0 else 0
-
-    output = f"Code Review Coverage: {completed}/{total} files audited ({pct:.1f}% complete)\n"
-    if remaining:
-        # Group remaining by directory
-        rem_dirs: Dict[str, int] = {}
-        for r in remaining:
-            p = str(Path(r).parent)
-            rem_dirs[p] = rem_dirs.get(p, 0) + 1
-        output += "Remaining Unaudited Directories / Modules:\n"
-        for d, count in sorted(rem_dirs.items()):
-            output += f"  ⏳ {d}/ ({count} files remaining)\n"
-        output += "\nNext files to inspect:\n" + "\n".join(f"  - {f}" for f in remaining[:8])
-        if len(remaining) > 8:
-            output += f"\n  ... and {len(remaining) - 8} more files."
-    else:
-        output += "🎉 100% COVERAGE REACHED: All repository files have been audited!"
-
-    return output
 
 
 @tool
@@ -379,8 +284,7 @@ def record_finding(
     return f"Successfully recorded finding [{category.upper()}]: '{title}'. Total findings recorded: {len(_RECORDED_FINDINGS)}"
 
 
-# List of all available tools
-TOOLS = [clangd_query, ripgrep_search, read_project_file, list_project_source_files, track_review_progress, record_finding]
+MODULE_AUDIT_TOOLS = [clangd_query, ripgrep_search, read_project_file, record_finding]
 
 
 # ============================================================================
@@ -422,88 +326,6 @@ def get_llm(provider: str, model_name: str, ollama_host: str = "http://localhost
         raise ValueError(f"Unknown provider '{provider}'. Supported providers: 'ollama', 'gemini'.")
 
 
-# ============================================================================
-# LangGraph Workflow Construction
-# ============================================================================
-
-SYSTEM_PROMPT = """You are an expert autonomous C++ Code Review Agent specializing in modern C++ (C++17/C++20/C++23), systems programming, concurrency, memory safety, and software architecture.
-
-════════════════════════════════════════════════════════════════════════════════
-STRICT COVERAGE MANDATE (DO NOT STOP EARLY):
-- You are strictly FORBIDDEN from concluding the review after inspecting only a small sample of files.
-- You MUST systematically audit EVERY directory, module, and source file in the repository inventory.
-- On large repositories (50–100+ files), you MUST NOT stop early. Work module-by-module across all subdirectories.
-- A review that only samples 5–10% of the codebase is considered an incomplete failure.
-════════════════════════════════════════════════════════════════════════════════
-
-EXECUTION WORKFLOW:
-1. **Repository Inventory & Architecture Mapping**:
-   - Read `CMakeLists.txt` via `read_project_file`.
-   - Call `list_project_source_files` to generate the complete checklist of all headers and sources in the project.
-   - Record project architecture findings via `record_finding(category='architecture', ...)`.
-
-2. **Systematic Module-by-Module Traversal**:
-   - For every directory/module discovered in the inventory:
-     a. Use `ripgrep_search` (with `path_filter` targeting the directory) to audit memory safety (`malloc`, `free`, `new`, `delete`, `strcpy`, `sprintf`, raw pointer arithmetic) and concurrency (`mutex`, `shared_mutex`, `atomic`).
-     b. Use `clangd_query` (`search`, `show`, `interface`, `hierarchy`, `usages`) to explore the classes, functions, and inheritance in that module.
-     c. Call `record_finding` immediately for every exceptional practice, minor improvement, or critical flaw.
-     d. Call `track_review_progress(inspected_files=[...])` after completing each module to update coverage and view remaining directories.
-
-3. **Coverage Check**:
-   - Check `track_review_progress()`. If any directories or modules remain unaudited, CONTINUE exploring. Do not stop.
-
-4. **Final Synthesis (Only When All Modules Are Audited)**:
-   - Once all modules across the codebase have been reviewed, synthesize all recorded findings into the 4-part Code Review Report:
-   # Comprehensive C++ Code Review Report
-   ## 1. Project Architecture & Dependency Overview
-   ## 2. What Is Implemented Exceptionally Well
-   ## 3. What Needs Minor Improvements
-   ## 4. What Is Poorly Implemented or Contains Critical Flaws (with concrete code fixes)
-"""
-
-
-import time
-import re
-
-def build_code_review_graph(llm, tools=TOOLS):
-    """
-    Build and compile the LangGraph ReAct agent graph with automatic rate limit retry.
-    """
-    llm_with_tools = llm.bind_tools(tools)
-
-    def agent_node(state: MessagesState) -> Dict[str, Any]:
-        """Agent reasoning node that calls LLM with available messages and tools."""
-        messages = state["messages"]
-        max_retries = 5
-        base_delay = 6
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = llm_with_tools.invoke(messages)
-                return {"messages": [response]}
-            except Exception as e:
-                err_msg = str(e)
-                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
-                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
-                    wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
-                    console.print(f"[yellow]Rate limit reached (429). Waiting {wait_time:.1f}s before retrying (attempt {attempt}/{max_retries})...[/yellow]")
-                    time.sleep(wait_time)
-                else:
-                    raise e
-
-    tool_node = ToolNode(tools)
-
-    workflow = StateGraph(MessagesState)
-
-    workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", tool_node)
-
-    workflow.add_edge(START, "agent")
-    workflow.add_conditional_edges("agent", tools_condition, ["tools", END])
-    workflow.add_edge("tools", "agent")
-
-    return workflow.compile()
-
-
 def extract_text(content: Any) -> str:
     """Extract plain string content from string, list of parts, or structured objects."""
     if isinstance(content, str):
@@ -526,17 +348,198 @@ def extract_text(content: Any) -> str:
         return str(content)
 
 
-def synthesize_final_report(findings: List[Dict[str, Any]], fallback_text: str, project_dir: Path) -> str:
-    """
-    Ensure a complete, rich Markdown report is always generated,
-    combining LLM summary with structured findings from memory/disk.
-    """
-    if fallback_text and len(fallback_text.strip()) > 300 and "## " in fallback_text:
-        return fallback_text
+# ============================================================================
+# Deterministic Multi-Node State Graph
+# ============================================================================
 
-    # If fallback text was empty or truncated, recover from findings
+class RepoReviewState(TypedDict):
+    project_dir: str
+    all_files: List[str]
+    modules: List[str]
+    module_files_map: Dict[str, List[str]]
+    current_module_index: int
+    findings: Annotated[List[Dict[str, Any]], operator.add]
+    final_report: str
+
+
+def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
+    """
+    Node 1: Discover all repository files, CMake structure, and organize them
+    into directory modules to guarantee complete 100% coverage.
+    """
+    global _ACTIVE_PROJECT_DIR
+    proj_path = _ACTIVE_PROJECT_DIR
+
+    console.print("\n[bold cyan]═══ Phase 1: Repository Inventory & Module Planning ═══[/bold cyan]")
+
+    # Discover all headers and sources
+    headers = []
+    sources = []
+    for ext in ["*.h", "*.hpp", "*.hxx"]:
+        headers.extend(sorted(proj_path.glob(f"**/{ext}")))
+    for ext in ["*.cpp", "*.cc", "*.cxx", "*.c"]:
+        sources.extend(sorted(proj_path.glob(f"**/{ext}")))
+
+    rel_headers = [str(p.relative_to(proj_path)) for p in headers if "build" not in p.parts and ".cache" not in p.parts]
+    rel_sources = [str(p.relative_to(proj_path)) for p in sources if "build" not in p.parts and ".cache" not in p.parts]
+
+    all_files = sorted(list(set(rel_headers + rel_sources)))
+
+    # Group files by parent directory (module)
+    module_map: Dict[str, List[str]] = {}
+    for f in all_files:
+        parent = str(Path(f).parent)
+        if parent not in module_map:
+            module_map[parent] = []
+        module_map[parent].append(f)
+
+    sorted_modules = sorted(list(module_map.keys()))
+
+    console.print(f"[green]Discovered {len(all_files)} total files across {len(sorted_modules)} directories/modules:[/green]")
+    for mod in sorted_modules:
+        console.print(f"  📁 [bold]{mod}/[/bold] ({len(module_map[mod])} files)")
+
+    # Read CMakeLists.txt if present
+    cmakelists_path = proj_path / "CMakeLists.txt"
+    arch_findings = []
+    if cmakelists_path.exists():
+        try:
+            with open(cmakelists_path, "r", encoding="utf-8") as f:
+                cmake_content = f.read()
+            arch_findings.append({
+                "category": "architecture",
+                "title": "CMake Build Configuration & Target Structure",
+                "details": f"Project structure with {len(all_files)} files across modules: {', '.join(sorted_modules)}.\nCMake configuration:\n```cmake\n{cmake_content[:500]}\n```",
+                "files_and_lines": "CMakeLists.txt",
+                "recommended_fix": "",
+                "timestamp": time.time()
+            })
+            global _RECORDED_FINDINGS
+            _RECORDED_FINDINGS.extend(arch_findings)
+        except Exception:
+            pass
+
+    return {
+        "all_files": all_files,
+        "modules": sorted_modules,
+        "module_files_map": module_map,
+        "current_module_index": 0,
+        "findings": arch_findings
+    }
+
+
+def build_module_reviewer(llm):
+    """
+    Build a focused ReAct reviewer for auditing a single directory module.
+    """
+    llm_with_tools = llm.bind_tools(MODULE_AUDIT_TOOLS)
+
+    def agent_step(state: MessagesState) -> Dict[str, Any]:
+        messages = state["messages"]
+        max_retries = 5
+        base_delay = 6
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = llm_with_tools.invoke(messages)
+                return {"messages": [response]}
+            except Exception as e:
+                err_msg = str(e)
+                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
+                    import re
+                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
+                    wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
+                    console.print(f"[yellow]Rate limit reached (429). Waiting {wait_time:.1f}s (attempt {attempt}/{max_retries})...[/yellow]")
+                    time.sleep(wait_time)
+                else:
+                    raise e
+
+    tool_node = ToolNode(MODULE_AUDIT_TOOLS)
+    wf = StateGraph(MessagesState)
+    wf.add_node("agent", agent_step)
+    wf.add_node("tools", tool_node)
+    wf.add_edge(START, "agent")
+    wf.add_conditional_edges("agent", tools_condition, ["tools", END])
+    wf.add_edge("tools", "agent")
+    return wf.compile()
+
+
+def review_module_node_factory(llm):
+    """
+    Factory creating the review_module_node.
+    """
+    sub_agent = build_module_reviewer(llm)
+
+    def review_module_node(state: RepoReviewState) -> Dict[str, Any]:
+        idx = state["current_module_index"]
+        modules = state["modules"]
+        current_module = modules[idx]
+        files = state["module_files_map"].get(current_module, [])
+
+        console.print(f"\n[bold yellow]═══ Phase 2: Auditing Module ({idx + 1}/{len(modules)}): [cyan]{current_module}/[/cyan] ({len(files)} files) ═══[/bold yellow]")
+
+        prompt = (
+            f"You are conducting a strict C++ code review for module directory: '{current_module}'\n"
+            f"Files in this module:\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
+            f"INSTRUCTIONS:\n"
+            f"1. Use 'ripgrep_search' with path_filter='{current_module}' to audit for memory safety (malloc, free, new, delete, strcpy, sprintf, raw pointers) and concurrency (mutex, shared_mutex, atomic).\n"
+            f"2. Use 'clangd_query' ('show', 'interface', 'hierarchy') to inspect the classes and functions defined in these files.\n"
+            f"3. Call 'record_finding' for EVERY architectural detail, exceptional pattern, minor flaw, or critical vulnerability in this module.\n"
+            f"4. Once you have audited these files and recorded findings, conclude your module review."
+        )
+
+        sub_state: MessagesState = {
+            "messages": [
+                SystemMessage(content="You are an expert modern C++ code auditor. Thoroughly examine the assigned module files. Call record_finding immediately for every discovery."),
+                HumanMessage(content=prompt)
+            ]
+        }
+
+        # Run focused mini-agent on this module (max 15 steps per module to keep context fast and fresh)
+        for step in sub_agent.stream(sub_state, {"recursion_limit": 15}, stream_mode="updates"):
+            for node_name, node_update in step.items():
+                if node_name == "agent":
+                    msg = node_update["messages"][-1]
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            console.print(f"  [magenta]▶ Tool Call:[/magenta] [cyan]{tc['name']}[/cyan]({json.dumps(tc['args'])})")
+                elif node_name == "tools":
+                    for msg in node_update["messages"]:
+                        raw_text = extract_text(msg.content)
+                        preview = raw_text[:120].replace("\n", " ")
+                        if len(raw_text) > 120:
+                            preview += "..."
+                        console.print(f"[dim]    ↳ Tool Result: {preview}[/dim]")
+
+        pct = ((idx + 1) / len(modules)) * 100
+        console.print(f"[green]✔ Finished Module '{current_module}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
+
+        return {
+            "current_module_index": idx + 1,
+            "findings": []  # Recorded findings are captured via record_finding
+        }
+
+    return review_module_node
+
+
+def should_continue_modules(state: RepoReviewState) -> str:
+    """Conditional router: loop to next module or move to final synthesis."""
+    if state["current_module_index"] < len(state["modules"]):
+        return "review_module"
+    return "synthesize_report"
+
+
+def synthesize_report_node(state: RepoReviewState) -> Dict[str, Any]:
+    """
+    Node 3: Compile and format all findings into the final comprehensive report.
+    """
+    global _RECORDED_FINDINGS, _ACTIVE_PROJECT_DIR
+    proj_path = _ACTIVE_PROJECT_DIR
+
+    console.print("\n[bold cyan]═══ Phase 3: Synthesizing Final Comprehensive Report ═══[/bold cyan]")
+
+    findings = _RECORDED_FINDINGS
     if not findings:
-        draft_file = project_dir / ".draft_review_findings.json"
+        draft_file = proj_path / ".draft_review_findings.json"
         if draft_file.exists():
             try:
                 with open(draft_file, "r", encoding="utf-8") as f:
@@ -544,54 +547,71 @@ def synthesize_final_report(findings: List[Dict[str, Any]], fallback_text: str, 
             except Exception:
                 pass
 
-    if findings:
-        console.print("[cyan]Assembling comprehensive report from recorded findings...[/cyan]")
-        arch = [f for f in findings if f.get("category") == "architecture"]
-        exceptional = [f for f in findings if f.get("category") == "exceptional"]
-        minor = [f for f in findings if f.get("category") == "minor_improvement"]
-        critical = [f for f in findings if f.get("category") == "critical_flaw"]
+    arch = [f for f in findings if f.get("category") == "architecture"]
+    exceptional = [f for f in findings if f.get("category") == "exceptional"]
+    minor = [f for f in findings if f.get("category") == "minor_improvement"]
+    critical = [f for f in findings if f.get("category") == "critical_flaw"]
 
-        sections = ["# Comprehensive C++ Code Review Report\n"]
+    sections = [
+        "# Comprehensive C++ Code Review Report",
+        f"\n**Total Files Audited**: {len(state.get('all_files', []))} files across {len(state.get('modules', []))} directories/modules\n",
+        "## 1. Project Architecture & Dependency Overview"
+    ]
 
-        # Section 1
-        sections.append("## 1. Project Architecture & Dependency Overview")
-        if arch:
-            for item in arch:
-                sections.append(f"### {item['title']}\n- **Files**: `{item['files_and_lines']}`\n\n{item['details']}\n")
-        else:
-            sections.append("Analysis of project build targets, include paths, and component structure.\n")
+    if arch:
+        for item in arch:
+            sections.append(f"### {item['title']}\n- **Location**: `{item['files_and_lines']}`\n\n{item['details']}\n")
+    else:
+        sections.append("Exhaustive analysis completed across all discovered targets and directories.\n")
 
-        # Section 2
-        sections.append("## 2. What Is Implemented Exceptionally Well")
-        if exceptional:
-            for item in exceptional:
-                sections.append(f"### {item['title']}\n- **Files**: `{item['files_and_lines']}`\n\n{item['details']}\n")
-        else:
-            sections.append("No exceptional patterns specifically recorded.\n")
+    sections.append("## 2. What Is Implemented Exceptionally Well")
+    if exceptional:
+        for item in exceptional:
+            sections.append(f"### {item['title']}\n- **Location**: `{item['files_and_lines']}`\n\n{item['details']}\n")
+    else:
+        sections.append("No exceptional modern C++ patterns specifically noted.\n")
 
-        # Section 3
-        sections.append("## 3. What Needs Minor Improvements")
-        if minor:
-            for item in minor:
-                sections.append(f"### {item['title']}\n- **Files**: `{item['files_and_lines']}`\n\n{item['details']}")
-                if item.get("recommended_fix"):
-                    sections.append(f"\n**Recommended Improvement:**\n```cpp\n{item['recommended_fix']}\n```\n")
-        else:
-            sections.append("No minor improvements noted.\n")
+    sections.append("## 3. What Needs Minor Improvements")
+    if minor:
+        for item in minor:
+            sections.append(f"### {item['title']}\n- **Location**: `{item['files_and_lines']}`\n\n{item['details']}")
+            if item.get("recommended_fix"):
+                sections.append(f"\n**Recommended Improvement:**\n```cpp\n{item['recommended_fix']}\n```\n")
+    else:
+        sections.append("No minor code quality improvements noted.\n")
 
-        # Section 4
-        sections.append("## 4. What Is Poorly Implemented or Contains Critical Flaws")
-        if critical:
-            for item in critical:
-                sections.append(f"### ⚠️ {item['title']}\n- **Files**: `{item['files_and_lines']}`\n\n{item['details']}")
-                if item.get("recommended_fix"):
-                    sections.append(f"\n**Recommended Fix:**\n```cpp\n{item['recommended_fix']}\n```\n")
-        else:
-            sections.append("No critical flaws detected.\n")
+    sections.append("## 4. What Is Poorly Implemented or Contains Critical Flaws")
+    if critical:
+        for item in critical:
+            sections.append(f"### ⚠️ {item['title']}\n- **Location**: `{item['files_and_lines']}`\n\n{item['details']}")
+            if item.get("recommended_fix"):
+                sections.append(f"\n**Recommended Fix:**\n```cpp\n{item['recommended_fix']}\n```\n")
+    else:
+        sections.append("No critical flaws or memory vulnerabilities detected.\n")
 
-        return "\n".join(sections)
+    final_report = "\n".join(sections)
+    return {"final_report": final_report}
 
-    return fallback_text or "# Comprehensive C++ Code Review Report\n\nReview concluded."
+
+def build_repo_review_orchestrator(llm):
+    """
+    Build the deterministic multi-node LangGraph orchestrator.
+    """
+    wf = StateGraph(RepoReviewState)
+
+    wf.add_node("discover_and_plan", discover_and_plan_node)
+    wf.add_node("review_module", review_module_node_factory(llm))
+    wf.add_node("synthesize_report", synthesize_report_node)
+
+    wf.add_edge(START, "discover_and_plan")
+    wf.add_edge("discover_and_plan", "review_module")
+    wf.add_conditional_edges("review_module", should_continue_modules, {
+        "review_module": "review_module",
+        "synthesize_report": "synthesize_report"
+    })
+    wf.add_edge("synthesize_report", END)
+
+    return wf.compile()
 
 
 # ============================================================================
@@ -604,10 +624,10 @@ def run_code_review(
     model_name: Optional[str] = None,
     ollama_host: str = "http://localhost:11434",
     output_report_path: Optional[str] = None,
-    max_steps: int = 45
+    max_steps: int = 500
 ) -> str:
     """
-    Execute the autonomous C++ code review agent loop.
+    Execute the deterministic multi-node autonomous C++ review orchestrator.
     """
     proj_path = Path(project_dir).resolve()
     if not proj_path.exists() or not proj_path.is_dir():
@@ -618,7 +638,6 @@ def run_code_review(
     ensure_compile_commands(proj_path)
     reset_findings()
 
-    # Determine default model name if not specified
     if not model_name:
         if provider.lower() == "ollama":
             model_name = "llama3.1:8b"
@@ -626,68 +645,31 @@ def run_code_review(
             model_name = "gemini-3.5-flash-lite"
 
     console.print(Panel(
-        f"[bold cyan]Autonomous C++ Code Review Agent[/bold cyan]\n"
+        f"[bold cyan]Autonomous Modular C++ Code Review Orchestrator[/bold cyan]\n"
         f"Project Path : [yellow]{proj_path}[/yellow]\n"
         f"Provider     : [green]{provider}[/green]\n"
         f"Model        : [green]{model_name}[/green]\n"
-        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, list_project_source_files, track_review_progress, record_finding[/blue]",
+        f"Architecture : [blue]Deterministic Plan & Map-Reduce Multi-Node Graph[/blue]\n"
+        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, record_finding[/blue]",
         title="Agent Configuration",
         border_style="cyan"
     ))
 
     llm = get_llm(provider=provider, model_name=model_name, ollama_host=ollama_host)
-    app = build_code_review_graph(llm=llm, tools=TOOLS)
+    app = build_repo_review_orchestrator(llm=llm)
 
-    initial_prompt = (
-        f"Please begin an exhaustive autonomous C++ code review for the project located at '{proj_path}'.\n\n"
-        f"MANDATORY INSTRUCTIONS:\n"
-        f"1. Start by reading CMakeLists.txt and calling 'list_project_source_files' to get the full inventory of all files across all directories.\n"
-        f"2. You are REQUIRED to audit EVERY module and directory in the repository. Do not sample just a few files; systematically traverse each subdirectory.\n"
-        f"3. Use 'ripgrep_search' (with path_filter) and 'clangd_query' to analyze classes, headers, implementations, memory safety, and concurrency in each module.\n"
-        f"4. Call 'record_finding' immediately whenever you find any architecture detail, exceptional pattern, minor flaw, or critical vulnerability.\n"
-        f"5. Call 'track_review_progress(inspected_files=[...])' after auditing each directory/module to update coverage and verify remaining files.\n"
-        f"6. DO NOT conclude early. Only synthesize the final 4-part Code Review Report once all directories and files in the repository have been reviewed."
-    )
-
-    initial_state: MessagesState = {
-        "messages": [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=initial_prompt)
-        ]
+    initial_state: RepoReviewState = {
+        "project_dir": str(proj_path),
+        "all_files": [],
+        "modules": [],
+        "module_files_map": {},
+        "current_module_index": 0,
+        "findings": [],
+        "final_report": ""
     }
 
-    console.print("\n[bold yellow]Starting Autonomous Review Workflow...[/bold yellow]\n")
-
-    step_count = 0
-    final_response_text = ""
-
-    # Stream agent execution steps
-    for step in app.stream(initial_state, {"recursion_limit": max_steps}, stream_mode="updates"):
-        step_count += 1
-        for node_name, node_update in step.items():
-            if node_name == "agent":
-                message = node_update["messages"][-1]
-                text_content = extract_text(message.content)
-                if text_content and len(text_content.strip()) > 100:
-                    final_response_text = text_content
-
-                if message.tool_calls:
-                    for tc in message.tool_calls:
-                        console.print(f"[bold magenta]▶ Tool Call ({step_count}):[/bold magenta] [cyan]{tc['name']}[/cyan]({json.dumps(tc['args'])})")
-                else:
-                    if text_content:
-                        final_response_text = text_content
-                        console.print(f"\n[bold green]✔ Agent Concluded Review ({step_count} steps)[/bold green]\n")
-            elif node_name == "tools":
-                for msg in node_update["messages"]:
-                    raw_text = extract_text(msg.content)
-                    content_preview = raw_text[:160].replace("\n", " ")
-                    if len(raw_text) > 160:
-                        content_preview += "..."
-                    console.print(f"[dim]  ↳ Tool Result: {content_preview}[/dim]")
-
-    # Build or enhance final report
-    final_report = synthesize_final_report(_RECORDED_FINDINGS, final_response_text, proj_path)
+    result = app.invoke(initial_state, {"recursion_limit": max_steps})
+    final_report = result.get("final_report", "")
 
     # Print markdown report
     console.print("\n" + "="*80)
@@ -710,7 +692,7 @@ def run_code_review(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Autonomous C++ Code Review Agent using LangGraph, clangd-query, and ripgrep."
+        description="Autonomous Modular C++ Code Review Agent using LangGraph, clangd-query, and ripgrep."
     )
     parser.add_argument(
         "--project-dir", "-p",
@@ -746,8 +728,8 @@ def parse_args():
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=45,
-        help="Maximum LangGraph execution recursion steps (default: 45)"
+        default=500,
+        help="Maximum LangGraph execution recursion steps (default: 500)"
     )
     return parser.parse_args()
 

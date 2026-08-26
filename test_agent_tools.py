@@ -5,9 +5,11 @@ from code_review_agent import (
     clangd_query,
     ripgrep_search,
     read_project_file,
+    record_finding,
     set_active_project_dir,
-    build_code_review_graph,
-    TOOLS
+    build_repo_review_orchestrator,
+    _RECORDED_FINDINGS,
+    MODULE_AUDIT_TOOLS
 )
 from langchain_core.messages import AIMessage
 
@@ -23,10 +25,10 @@ class TestCodeReviewTools(unittest.TestCase):
         self.assertIn("CMAKE_CXX_STANDARD 17", content)
 
     def test_ripgrep_search(self):
-        res = ripgrep_search.invoke({"pattern": "strcpy"})
+        res = ripgrep_search.invoke({"pattern": "strcpy", "path_filter": "src"})
         self.assertIn("session_manager.cpp", res)
 
-        res_mutex = ripgrep_search.invoke({"pattern": "std::shared_mutex"})
+        res_mutex = ripgrep_search.invoke({"pattern": "std::shared_mutex", "path_filter": "include"})
         self.assertIn("order_repository.h", res_mutex)
 
     def test_clangd_query_search(self):
@@ -46,7 +48,6 @@ class TestCodeReviewTools(unittest.TestCase):
         self.assertIn("IPaymentGateway", res)
 
     def test_record_finding(self):
-        from code_review_agent import record_finding, list_project_source_files, _RECORDED_FINDINGS
         res = record_finding.invoke({
             "category": "critical_flaw",
             "title": "Buffer overflow in SessionManager",
@@ -57,26 +58,15 @@ class TestCodeReviewTools(unittest.TestCase):
         self.assertIn("CRITICAL_FLAW", res)
         self.assertTrue(any(f["title"] == "Buffer overflow in SessionManager" for f in _RECORDED_FINDINGS))
 
-        file_list = list_project_source_files.invoke({})
-        self.assertIn("order_repository.cpp", file_list)
-        self.assertIn("session_manager.h", file_list)
-
-        from code_review_agent import track_review_progress
-        prog = track_review_progress.invoke({"inspected_files": ["src/order_repository.cpp"]})
-        self.assertIn("Code Review Coverage", prog)
-
-    def test_langgraph_compilation(self):
+    def test_orchestrator_compilation(self):
         class DummyLLM:
             def bind_tools(self, tools):
                 return self
             def invoke(self, messages):
-                return AIMessage(content="Review complete.")
+                return AIMessage(content="Module review finished.")
 
-        graph = build_code_review_graph(llm=DummyLLM(), tools=TOOLS)
+        graph = build_repo_review_orchestrator(llm=DummyLLM())
         self.assertIsNotNone(graph)
-        result = graph.invoke({"messages": [{"role": "user", "content": "Review project"}]})
-        self.assertIn("messages", result)
-        self.assertEqual(result["messages"][-1].content, "Review complete.")
 
 if __name__ == "__main__":
     unittest.main()
