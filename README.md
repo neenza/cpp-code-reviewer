@@ -1,4 +1,4 @@
-# Autonomous C++ Code Review Agent
+# Autonomous C++ Code Review Agent in python
 
 An autonomous C++ Code Review Agent built with **LangGraph**, **Ollama**, and **Google Gemini API**, leveraging deep C++ semantic understanding via **`clangd-query`** and fast regex search via **`ripgrep` (`rg`)**.
 
