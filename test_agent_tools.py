@@ -61,6 +61,10 @@ class TestCodeReviewTools(unittest.TestCase):
         self.assertIn("order_repository.cpp", file_list)
         self.assertIn("session_manager.h", file_list)
 
+        from code_review_agent import track_review_progress
+        prog = track_review_progress.invoke({"inspected_files": ["src/order_repository.cpp"]})
+        self.assertIn("Code Review Coverage", prog)
+
     def test_langgraph_compilation(self):
         class DummyLLM:
             def bind_tools(self, tools):

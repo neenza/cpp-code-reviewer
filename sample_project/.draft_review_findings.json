@@ -1,50 +1,10 @@
 [
   {
-    "category": "architecture",
-    "title": "Project Build Architecture and Target Setup",
-    "details": "The project 'SampleOrderSystem' targets C++17. It defines a static/shared library `orders_lib` containing `src/order_repository.cpp`, `src/session_manager.cpp`, and `src/payment_processor.cpp`, and an executable `order_server` containing `src/main.cpp` linked against `orders_lib` and `pthread`. Headers are located in `include/`. Compilation database export is enabled.",
-    "files_and_lines": "CMakeLists.txt:1-20",
-    "recommended_fix": "None needed for architecture. Good standard CMake layout.",
-    "timestamp": 1787682658.1515675
-  },
-  {
-    "category": "exceptional",
-    "title": "Exemplary Thread-Safe OrderRepository with Reader-Writer Locking",
-    "details": "OrderRepository in `include/order_repository.h` and `src/order_repository.cpp` demonstrates exemplary modern C++ multi-threaded architecture. It uses `std::shared_mutex` combined with `std::shared_lock` for concurrent readers and `std::unique_lock` for exclusive writers. It strictly adheres to rule-of-zero/five by marking the class non-copyable (`= delete`) and movable (`= default`), utilizes `std::optional` for absent lookups, and applies `noexcept` to query methods like `count()`.",
-    "files_and_lines": "include/order_repository.h:17-37, src/order_repository.cpp:1-48",
-    "recommended_fix": "None. This is best-practice concurrent data structure design.",
-    "timestamp": 1787682677.965717
-  },
-  {
-    "category": "exceptional",
-    "title": "Clean Value Semantics and Encapsulation in Order Struct",
-    "details": "Order struct (`include/order.h`) cleanly encapsulates value semantics, uses standard library types (`std::string`, `std::vector`, `std::chrono::system_clock::time_point`, `std::optional`), and implements `calculate_total()` as a `[[nodiscard]]` `noexcept` inline member function.",
-    "files_and_lines": "include/order.h:25-40",
-    "recommended_fix": "None. Excellent value type design.",
-    "timestamp": 1787682681.2255726
-  },
-  {
-    "category": "minor_improvement",
-    "title": "Missing Virtual Destructor in Polymorphic Base Class IPaymentGateway",
-    "details": "`IPaymentGateway` interface in `include/payment_processor.h` declares virtual functions (`process`, `get_gateway_name`) but lacks a virtual destructor (`virtual ~IPaymentGateway() = default;`). While the current implementation instantiates gateways on the stack (`StripeGateway stripe;`), deleting a derived gateway instance through an `IPaymentGateway*` pointer would invoke undefined behavior (resource leak / slicing).",
-    "files_and_lines": "include/payment_processor.h:10-15",
-    "recommended_fix": "Add virtual destructor to IPaymentGateway:\n```cpp\nclass IPaymentGateway {\npublic:\n    virtual ~IPaymentGateway() = default;\n    virtual bool process(double amount, const std::string& currency) = 0;\n    virtual std::string get_gateway_name() const = 0;\n};\n```",
-    "timestamp": 1787682683.2640777
-  },
-  {
-    "category": "minor_improvement",
-    "title": "Pass-by-Value Without Move, Magic Numbers, and Unbounded Log in PaymentProcessor",
-    "details": "`PaymentProcessor::PaymentProcessor(std::string default_currency)` takes `std::string` by value without utilizing move semantics in the member initializer list (`: currency_(std::move(default_currency))`), causing an unnecessary copy when passing an lvalue or rvalue string. Also, `PaymentProcessor` contains a magic number (`10000.0` max transaction limit) and an unbounded `transaction_log_` vector that grows without bound.",
-    "files_and_lines": "include/payment_processor.h:25-33, src/payment_processor.cpp:15-35",
-    "recommended_fix": "1. Use std::move in constructor initializer:\n```cpp\nexplicit PaymentProcessor(std::string default_currency) : currency_(std::move(default_currency)) {}\n```\n2. Define a named constant for max transaction limit.\n3. Consider bounded queue or log rotation for `transaction_log_`.",
-    "timestamp": 1787682723.5615807
-  },
-  {
     "category": "critical_flaw",
-    "title": "Critical Memory Safety Flaws, Buffer Overflow, and Concurrency Bugs in SessionManager",
-    "details": "`SessionManager` (`include/session_manager.h` and `src/session_manager.cpp`) suffers from multiple critical safety and architectural flaws:\n1. **Buffer Overflow**: `strcpy(data->token, token_str)` in `create_session` does not check bounds against the fixed 32-byte `char token[32]` buffer in `SessionData`. If `token_str` exceeds 31 characters plus null terminator, a stack/heap buffer overflow occurs.\n2. **Manual Raw Memory Management (`malloc`/`free`/`new`/`delete`) & Rule of 3/5 Violation**: `SessionData` allocates `user_notes` via `malloc` and cleans up via `free` and `delete data`. `SessionManager` does not declare or delete copy constructor/assignment operators, leading to double-free and shallow copy corruption if copied.\n3. **Data Race / Missing Synchronization**: `active_sessions_` unordered_map is accessed across multiple potential threads without any synchronization (unlike `OrderRepository` which uses `std::shared_mutex`).\n4. **Use-After-Free & Dangling Pointer (`last_accessed_cache_`)**: In `invalidate_session`, `delete data` is called, but `last_accessed_cache_` (which may point to `data`) is left dangling. Subsequent calls to `get_session` or cache access can trigger use-after-free.\n5. **Memory Leak Risk**: If an exception were thrown during token handling or allocation, `user_notes` or `data` could leak.",
-    "files_and_lines": "include/session_manager.h:9-37, src/session_manager.cpp:15-77",
-    "recommended_fix": "Refactor `SessionData` and `SessionManager` to use modern C++ RAII and smart pointers (`std::string`, `std::unique_ptr`):\n```cpp\nnamespace order_system {\n\nstruct SessionData {\n    std::string token;\n    std::string user_notes;\n    uint32_t active_orders_count{0};\n};\n\nclass SessionManager {\npublic:\n    SessionManager() = default;\n    ~SessionManager() = default;\n\n    SessionManager(const SessionManager&) = delete;\n    SessionManager& operator=(const SessionManager&) = delete;\n    SessionManager(SessionManager&&) noexcept = default;\n    SessionManager& operator=(SessionManager&&) noexcept = default;\n\n    bool create_session(const std::string& session_id, std::string token_str, std::string notes);\n    std::optional<SessionData> get_session(const std::string& session_id);\n    void invalidate_session(const std::string& session_id);\n    void cleanup_all();\n\nprivate:\n    mutable std::shared_mutex mutex_;\n    std::unordered_map<std::string, SessionData> active_sessions_;\n};\n\n} // namespace order_system\n```",
-    "timestamp": 1787682727.808171
+    "title": "Buffer overflow in SessionManager",
+    "details": "strcpy without bounds check",
+    "files_and_lines": "src/session_manager.cpp:18",
+    "recommended_fix": "Use std::string or snprintf",
+    "timestamp": 1787748384.2311678
   }
 ]

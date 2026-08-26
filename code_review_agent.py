@@ -232,12 +232,26 @@ def read_project_file(
         return f"Error reading file '{file_path}': {e}"
 
 
+# Global state trackers for incremental review and coverage
+_RECORDED_FINDINGS: List[Dict[str, Any]] = []
+_ALL_PROJECT_FILES: List[str] = []
+_INSPECTED_FILES: set = set()
+
+
+def reset_findings() -> None:
+    """Reset the recorded findings store and file tracker for a new review run."""
+    global _RECORDED_FINDINGS, _ALL_PROJECT_FILES, _INSPECTED_FILES
+    _RECORDED_FINDINGS = []
+    _ALL_PROJECT_FILES = []
+    _INSPECTED_FILES = set()
+
+
 @tool
 def list_project_source_files() -> str:
-    """Scan and return all C++ header (.h, .hpp) and source (.cpp, .cc, .cxx) files in the project.
-    Use this to build an exhaustive checklist of files declared in CMakeLists.txt and verify every file is audited.
+    """Scan and return all C++ header (.h, .hpp) and source (.cpp, .cc, .cxx) files grouped by module/directory.
+    Initializes the mandatory coverage checklist for the entire repository.
     """
-    global _ACTIVE_PROJECT_DIR
+    global _ACTIVE_PROJECT_DIR, _ALL_PROJECT_FILES
     headers = []
     sources = []
     for ext in ["*.h", "*.hpp", "*.hxx"]:
@@ -249,20 +263,70 @@ def list_project_source_files() -> str:
     headers = [str(p.relative_to(_ACTIVE_PROJECT_DIR)) for p in headers if "build" not in p.parts and ".cache" not in p.parts]
     sources = [str(p.relative_to(_ACTIVE_PROJECT_DIR)) for p in sources if "build" not in p.parts and ".cache" not in p.parts]
 
-    output = f"Discovered {len(headers)} header(s) and {len(sources)} source file(s):\n"
-    output += "Headers:\n" + ("\n".join(f"  - {h}" for h in headers) if headers else "  (None)") + "\n"
-    output += "Sources:\n" + ("\n".join(f"  - {s}" for s in sources) if sources else "  (None)")
+    _ALL_PROJECT_FILES = sorted(list(set(headers + sources)))
+
+    # Group by parent directory
+    dir_groups: Dict[str, List[str]] = {}
+    for f in _ALL_PROJECT_FILES:
+        parent = str(Path(f).parent)
+        if parent not in dir_groups:
+            dir_groups[parent] = []
+        dir_groups[parent].append(f)
+
+    output = f"Total Repository Inventory: {len(_ALL_PROJECT_FILES)} files ({len(headers)} headers, {len(sources)} sources)\n\n"
+    output += "Directory / Module Breakdown:\n"
+    for d, files in sorted(dir_groups.items()):
+        output += f"📁 {d}/ ({len(files)} files):\n"
+        for f in files[:10]:
+            output += f"   - {f}\n"
+        if len(files) > 10:
+            output += f"   ... and {len(files) - 10} more files in {d}/\n"
+
+    output += "\nUse 'track_review_progress' to mark files as inspected as you complete each module."
     return output
 
 
-# Global findings storage for incremental report construction
-_RECORDED_FINDINGS: List[Dict[str, Any]] = []
+@tool
+def track_review_progress(
+    inspected_files: Optional[List[str]] = None
+) -> str:
+    """Track and report codebase review coverage.
+    Pass 'inspected_files' with a list of file paths you just audited (e.g. ['src/net/tcp.cpp', 'include/net/tcp.h']).
+    Returns the current audit coverage percentage and the list of remaining uninspected files/directories.
+    """
+    global _ALL_PROJECT_FILES, _INSPECTED_FILES
 
+    if inspected_files:
+        for f in inspected_files:
+            # Match normalized relative paths
+            clean_f = f.strip().lstrip("./")
+            _INSPECTED_FILES.add(clean_f)
 
-def reset_findings() -> None:
-    """Reset the recorded findings store for a new review run."""
-    global _RECORDED_FINDINGS
-    _RECORDED_FINDINGS = []
+    total = len(_ALL_PROJECT_FILES)
+    if total == 0:
+        return "No project files registered yet. Please call 'list_project_source_files' first."
+
+    completed = len(_INSPECTED_FILES)
+    remaining = [f for f in _ALL_PROJECT_FILES if f not in _INSPECTED_FILES]
+    pct = (completed / total) * 100 if total > 0 else 0
+
+    output = f"Code Review Coverage: {completed}/{total} files audited ({pct:.1f}% complete)\n"
+    if remaining:
+        # Group remaining by directory
+        rem_dirs: Dict[str, int] = {}
+        for r in remaining:
+            p = str(Path(r).parent)
+            rem_dirs[p] = rem_dirs.get(p, 0) + 1
+        output += "Remaining Unaudited Directories / Modules:\n"
+        for d, count in sorted(rem_dirs.items()):
+            output += f"  ⏳ {d}/ ({count} files remaining)\n"
+        output += "\nNext files to inspect:\n" + "\n".join(f"  - {f}" for f in remaining[:8])
+        if len(remaining) > 8:
+            output += f"\n  ... and {len(remaining) - 8} more files."
+    else:
+        output += "🎉 100% COVERAGE REACHED: All repository files have been audited!"
+
+    return output
 
 
 @tool
@@ -316,7 +380,7 @@ def record_finding(
 
 
 # List of all available tools
-TOOLS = [clangd_query, ripgrep_search, read_project_file, list_project_source_files, record_finding]
+TOOLS = [clangd_query, ripgrep_search, read_project_file, list_project_source_files, track_review_progress, record_finding]
 
 
 # ============================================================================
@@ -364,22 +428,37 @@ def get_llm(provider: str, model_name: str, ollama_host: str = "http://localhost
 
 SYSTEM_PROMPT = """You are an expert autonomous C++ Code Review Agent specializing in modern C++ (C++17/C++20/C++23), systems programming, concurrency, memory safety, and software architecture.
 
-Your workflow MUST be systematic, exhaustive, incremental, and thorough:
-1. **Analyze CMakeLists.txt & Build Source Checklist**:
-   - Read `CMakeLists.txt` using `read_project_file`.
-   - Call `list_project_source_files` to obtain the complete checklist of all header and source files in the project (including all sources under `set()`, `add_library()`, `add_executable()`, and `include_directories()`).
-   - Call `record_finding` with category='architecture' to record the project structure and build targets.
-2. **Exhaustive File & Symbol Exploration**:
-   - Systematically inspect EVERY file discovered in step 1. Do not skip any file.
-   - For each class/struct/function, use `clangd_query` (`show`, `interface`, `hierarchy`, `signature`, `usages`) to semantically inspect declarations and definitions.
-   - Use `ripgrep_search` to audit memory safety (`malloc`, `free`, `new`, `delete`, `strcpy`, raw pointers) and concurrency (`shared_mutex`, `mutex`, `atomic`).
-   - **INCREMENTAL RECORDING**: As soon as you identify an exceptional practice, a minor improvement, or a critical flaw in any file, call `record_finding` immediately.
-3. **Synthesis & Detailed Report**:
-   Synthesize all findings into the 4-part Code Review Report covering:
-   - ## 1. Project Architecture & Dependency Overview
-   - ## 2. What Is Implemented Exceptionally Well
-   - ## 3. What Needs Minor Improvements
-   - ## 4. What Is Poorly Implemented or Contains Critical Flaws (with code fixes)
+════════════════════════════════════════════════════════════════════════════════
+STRICT COVERAGE MANDATE (DO NOT STOP EARLY):
+- You are strictly FORBIDDEN from concluding the review after inspecting only a small sample of files.
+- You MUST systematically audit EVERY directory, module, and source file in the repository inventory.
+- On large repositories (50–100+ files), you MUST NOT stop early. Work module-by-module across all subdirectories.
+- A review that only samples 5–10% of the codebase is considered an incomplete failure.
+════════════════════════════════════════════════════════════════════════════════
+
+EXECUTION WORKFLOW:
+1. **Repository Inventory & Architecture Mapping**:
+   - Read `CMakeLists.txt` via `read_project_file`.
+   - Call `list_project_source_files` to generate the complete checklist of all headers and sources in the project.
+   - Record project architecture findings via `record_finding(category='architecture', ...)`.
+
+2. **Systematic Module-by-Module Traversal**:
+   - For every directory/module discovered in the inventory:
+     a. Use `ripgrep_search` (with `path_filter` targeting the directory) to audit memory safety (`malloc`, `free`, `new`, `delete`, `strcpy`, `sprintf`, raw pointer arithmetic) and concurrency (`mutex`, `shared_mutex`, `atomic`).
+     b. Use `clangd_query` (`search`, `show`, `interface`, `hierarchy`, `usages`) to explore the classes, functions, and inheritance in that module.
+     c. Call `record_finding` immediately for every exceptional practice, minor improvement, or critical flaw.
+     d. Call `track_review_progress(inspected_files=[...])` after completing each module to update coverage and view remaining directories.
+
+3. **Coverage Check**:
+   - Check `track_review_progress()`. If any directories or modules remain unaudited, CONTINUE exploring. Do not stop.
+
+4. **Final Synthesis (Only When All Modules Are Audited)**:
+   - Once all modules across the codebase have been reviewed, synthesize all recorded findings into the 4-part Code Review Report:
+   # Comprehensive C++ Code Review Report
+   ## 1. Project Architecture & Dependency Overview
+   ## 2. What Is Implemented Exceptionally Well
+   ## 3. What Needs Minor Improvements
+   ## 4. What Is Poorly Implemented or Contains Critical Flaws (with concrete code fixes)
 """
 
 
@@ -551,7 +630,7 @@ def run_code_review(
         f"Project Path : [yellow]{proj_path}[/yellow]\n"
         f"Provider     : [green]{provider}[/green]\n"
         f"Model        : [green]{model_name}[/green]\n"
-        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, list_project_source_files, record_finding[/blue]",
+        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, list_project_source_files, track_review_progress, record_finding[/blue]",
         title="Agent Configuration",
         border_style="cyan"
     ))
@@ -560,11 +639,14 @@ def run_code_review(
     app = build_code_review_graph(llm=llm, tools=TOOLS)
 
     initial_prompt = (
-        f"Please begin an autonomous comprehensive C++ code review for the project located at '{proj_path}'.\n"
-        f"1. Read and analyze CMakeLists.txt and record architecture findings with record_finding.\n"
-        f"2. Systematically explore the symbols and files using clangd_query and ripgrep_search.\n"
-        f"3. Record all exceptional patterns, minor improvements, and critical flaws with record_finding as you find them.\n"
-        f"4. Conclude with the full 4-part Code Review Report."
+        f"Please begin an exhaustive autonomous C++ code review for the project located at '{proj_path}'.\n\n"
+        f"MANDATORY INSTRUCTIONS:\n"
+        f"1. Start by reading CMakeLists.txt and calling 'list_project_source_files' to get the full inventory of all files across all directories.\n"
+        f"2. You are REQUIRED to audit EVERY module and directory in the repository. Do not sample just a few files; systematically traverse each subdirectory.\n"
+        f"3. Use 'ripgrep_search' (with path_filter) and 'clangd_query' to analyze classes, headers, implementations, memory safety, and concurrency in each module.\n"
+        f"4. Call 'record_finding' immediately whenever you find any architecture detail, exceptional pattern, minor flaw, or critical vulnerability.\n"
+        f"5. Call 'track_review_progress(inspected_files=[...])' after auditing each directory/module to update coverage and verify remaining files.\n"
+        f"6. DO NOT conclude early. Only synthesize the final 4-part Code Review Report once all directories and files in the repository have been reviewed."
     )
 
     initial_state: MessagesState = {
