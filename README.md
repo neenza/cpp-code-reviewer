@@ -82,7 +82,7 @@ cp .env.example .env
 
 ### A. Testing with Google Gemini API
 ```bash
-python code_review_agent.py --provider gemini --model gemini-2.5-flash --project-dir sample_project
+python code_review_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
 ```
 
 ### B. Running with Local Ollama
@@ -102,10 +102,11 @@ python code_review_agent.py --provider ollama --model qwen2.5:14b --ollama-host 
 |---|---|---|
 | `--project-dir`, `-p` | Path to the target C++ codebase | `./sample_project` |
 | `--provider` | LLM backend: `gemini`, `google`, or `ollama` | `gemini` |
-| `--model`, `-m` | Model name (e.g., `gemini-2.5-flash`, `llama3.1:8b`, `qwen2.5:14b`) | Provider default |
+| `--model`, `-m` | Model name (e.g., `gemini-3.5-flash-lite`, `llama3.1:8b`, `qwen2.5:14b`) | `gemini-3.5-flash-lite` |
 | `--ollama-host` | URL of the Ollama server | `http://localhost:11434` |
+| `--ignore-dirs` | Comma-separated list of directories to ignore (e.g. `third_party,external,vendor,tests`) | Built-in third-party exclusions |
 | `--output`, `-o` | Output Markdown report file path | `<project-dir>/CPP_CODE_REVIEW_REPORT.md` |
-| `--max-steps` | Maximum LangGraph recursion iterations | `30` |
+| `--max-steps` | Maximum LangGraph execution recursion steps | `500` |
 
 ---
 

@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
+from rich.markup import escape
 
 # LangChain / LangGraph imports
 from langchain_core.tools import tool
@@ -280,7 +281,7 @@ def record_finding(
         "critical_flaw": "[red]CRITICAL FLAW[/red]"
     }.get(category, category.upper())
 
-    console.print(f"  [bold]📝 Recorded Finding ({cat_badge}):[/bold] {title} ({files_and_lines})")
+    console.print(f"  [bold]📝 Recorded Finding ({cat_badge}):[/bold] {escape(title)} ({escape(files_and_lines)})")
     return f"Successfully recorded finding [{category.upper()}]: '{title}'. Total findings recorded: {len(_RECORDED_FINDINGS)}"
 
 
@@ -362,17 +363,59 @@ class RepoReviewState(TypedDict):
     final_report: str
 
 
+DEFAULT_IGNORED_DIRS = {
+    "build", ".cache", ".git", ".vscode", ".idea",
+    "third_party", "thirdparty", "external", "vendor",
+    "deps", "_deps", "vcpkg_installed", "conan", "submodules"
+}
+
+
+def is_ignored_path(rel_path: Path, custom_ignored: Optional[set] = None) -> bool:
+    """Check if a path belongs to an ignored/third-party directory."""
+    ignored = DEFAULT_IGNORED_DIRS.union(custom_ignored or set())
+    for part in rel_path.parts:
+        if part.lower() in ignored or part.startswith("."):
+            return True
+    return False
+
+
 def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
     """
-    Node 1: Discover all repository files, CMake structure, and organize them
-    into directory modules to guarantee complete 100% coverage.
+    Node 1: Discover active project source files and CMake structure,
+    excluding third-party/vendor libraries not managed as core codebase.
     """
     global _ACTIVE_PROJECT_DIR
     proj_path = _ACTIVE_PROJECT_DIR
 
     console.print("\n[bold cyan]═══ Phase 1: Repository Inventory & Module Planning ═══[/bold cyan]")
 
-    # Discover all headers and sources
+    # Check compile_commands.json for exact CMake compiled translation units
+    cc_sources = set()
+    for cc_file in [proj_path / "compile_commands.json", proj_path / "build" / "compile_commands.json"]:
+        if cc_file.exists():
+            try:
+                with open(cc_file, "r", encoding="utf-8") as f:
+                    entries = json.load(f)
+                for entry in entries:
+                    src_file = entry.get("file")
+                    if src_file:
+                        p = Path(src_file)
+                        if p.is_absolute():
+                            try:
+                                rel = p.relative_to(proj_path)
+                                if not is_ignored_path(rel):
+                                    cc_sources.add(str(rel))
+                            except ValueError:
+                                pass
+                        else:
+                            if not is_ignored_path(p):
+                                cc_sources.add(str(p))
+            except Exception:
+                pass
+            if cc_sources:
+                break
+
+    # Discover headers and sources in project
     headers = []
     sources = []
     for ext in ["*.h", "*.hpp", "*.hxx"]:
@@ -380,8 +423,23 @@ def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
     for ext in ["*.cpp", "*.cc", "*.cxx", "*.c"]:
         sources.extend(sorted(proj_path.glob(f"**/{ext}")))
 
-    rel_headers = [str(p.relative_to(proj_path)) for p in headers if "build" not in p.parts and ".cache" not in p.parts]
-    rel_sources = [str(p.relative_to(proj_path)) for p in sources if "build" not in p.parts and ".cache" not in p.parts]
+    rel_headers = []
+    for p in headers:
+        try:
+            rel = p.relative_to(proj_path)
+            if not is_ignored_path(rel):
+                rel_headers.append(str(rel))
+        except ValueError:
+            pass
+
+    rel_sources = []
+    for p in sources:
+        try:
+            rel = p.relative_to(proj_path)
+            if not is_ignored_path(rel):
+                rel_sources.append(str(rel))
+        except ValueError:
+            pass
 
     all_files = sorted(list(set(rel_headers + rel_sources)))
 
@@ -395,9 +453,11 @@ def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
 
     sorted_modules = sorted(list(module_map.keys()))
 
-    console.print(f"[green]Discovered {len(all_files)} total files across {len(sorted_modules)} directories/modules:[/green]")
+    console.print(f"[green]Discovered {len(all_files)} primary project files across {len(sorted_modules)} core directories/modules:[/green]")
+    if cc_sources:
+        console.print(f"  [dim](Validated {len(cc_sources)} active compilation units from compile_commands.json)[/dim]")
     for mod in sorted_modules:
-        console.print(f"  📁 [bold]{mod}/[/bold] ({len(module_map[mod])} files)")
+        console.print(f"  📁 [bold]{escape(mod)}/[/bold] ({len(module_map[mod])} files)")
 
     # Read CMakeLists.txt if present
     cmakelists_path = proj_path / "CMakeLists.txt"
@@ -409,7 +469,7 @@ def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
             arch_findings.append({
                 "category": "architecture",
                 "title": "CMake Build Configuration & Target Structure",
-                "details": f"Project structure with {len(all_files)} files across modules: {', '.join(sorted_modules)}.\nCMake configuration:\n```cmake\n{cmake_content[:500]}\n```",
+                "details": f"Core project structure with {len(all_files)} files across modules: {', '.join(sorted_modules)}.\nCMake configuration:\n```cmake\n{cmake_content[:500]}\n```",
                 "files_and_lines": "CMakeLists.txt",
                 "recommended_fix": "",
                 "timestamp": time.time()
@@ -475,7 +535,7 @@ def review_module_node_factory(llm):
         current_module = modules[idx]
         files = state["module_files_map"].get(current_module, [])
 
-        console.print(f"\n[bold yellow]═══ Phase 2: Auditing Module ({idx + 1}/{len(modules)}): [cyan]{current_module}/[/cyan] ({len(files)} files) ═══[/bold yellow]")
+        console.print(f"\n[bold yellow]═══ Phase 2: Auditing Module ({idx + 1}/{len(modules)}): [cyan]{escape(current_module)}/[/cyan] ({len(files)} files) ═══[/bold yellow]")
 
         prompt = (
             f"You are conducting a strict C++ code review for module directory: '{current_module}'\n"
@@ -501,17 +561,17 @@ def review_module_node_factory(llm):
                     msg = node_update["messages"][-1]
                     if msg.tool_calls:
                         for tc in msg.tool_calls:
-                            console.print(f"  [magenta]▶ Tool Call:[/magenta] [cyan]{tc['name']}[/cyan]({json.dumps(tc['args'])})")
+                            console.print(f"  [magenta]▶ Tool Call:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})")
                 elif node_name == "tools":
                     for msg in node_update["messages"]:
                         raw_text = extract_text(msg.content)
                         preview = raw_text[:120].replace("\n", " ")
                         if len(raw_text) > 120:
                             preview += "..."
-                        console.print(f"[dim]    ↳ Tool Result: {preview}[/dim]")
+                        console.print(f"[dim]    ↳ Tool Result: {escape(preview)}[/dim]")
 
         pct = ((idx + 1) / len(modules)) * 100
-        console.print(f"[green]✔ Finished Module '{current_module}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
+        console.print(f"[green]✔ Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
 
         return {
             "current_module_index": idx + 1,
@@ -726,6 +786,12 @@ def parse_args():
         help="Output path for the generated markdown review report (default: <project-dir>/CPP_CODE_REVIEW_REPORT.md)"
     )
     parser.add_argument(
+        "--ignore-dirs",
+        type=str,
+        default="",
+        help="Comma-separated directory names to ignore during audit (e.g. 'third_party,external,vendor,tests')"
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=500,
@@ -736,6 +802,11 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.ignore_dirs:
+        for d in args.ignore_dirs.split(","):
+            if d.strip():
+                DEFAULT_IGNORED_DIRS.add(d.strip().lower())
+
     run_code_review(
         project_dir=args.project_dir,
         provider=args.provider,
