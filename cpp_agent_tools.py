@@ -283,4 +283,44 @@ def get_llm(provider: str, model_name: str, ollama_host: str = "http://localhost
         raise ValueError(f"Unknown provider '{provider}'. Supported providers: 'ollama', 'gemini'.")
 
 
-COMMON_CPP_TOOLS = [clangd_query, ripgrep_search, read_project_file]
+@tool
+def list_project_structure(max_files_per_dir: int = 15) -> str:
+    """List directory structure, modules, headers (.h, .hpp), and sources (.cpp, .cc) in the project.
+    Ideal as the very first step to understand repository layout, directory hierarchy, and key modules.
+    """
+    global _ACTIVE_PROJECT_DIR
+    proj_path = _ACTIVE_PROJECT_DIR
+
+    ignored = {
+        "build", ".cache", ".git", ".vscode", ".idea",
+        "third_party", "thirdparty", "external", "vendor",
+        "deps", "_deps", "vcpkg_installed", "conan", "submodules"
+    }
+
+    def is_ignored(p: Path) -> bool:
+        return any(part.lower() in ignored or part.startswith(".") for part in p.parts)
+
+    headers = [p.relative_to(proj_path) for p in sorted(proj_path.glob("**/*.h*")) if not is_ignored(p)]
+    sources = [p.relative_to(proj_path) for p in sorted(proj_path.glob("**/*.c*")) if not is_ignored(p)]
+
+    all_files = sorted(list(set(headers + sources)))
+    dir_map: Dict[str, List[str]] = {}
+    for f in all_files:
+        parent = str(f.parent)
+        if parent not in dir_map:
+            dir_map[parent] = []
+        dir_map[parent].append(str(f))
+
+    lines = [f"Project Root: {proj_path.name}/ ({len(all_files)} C++ files across {len(dir_map)} directories)\n"]
+    for d, files in sorted(dir_map.items()):
+        lines.append(f"📁 {d}/ ({len(files)} files)")
+        for f in files[:max_files_per_dir]:
+            lines.append(f"   ├── {Path(f).name}")
+        if len(files) > max_files_per_dir:
+            lines.append(f"   └── ... ({len(files) - max_files_per_dir} more files)")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+COMMON_CPP_TOOLS = [clangd_query, ripgrep_search, read_project_file, list_project_structure]

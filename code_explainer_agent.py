@@ -124,7 +124,8 @@ def run_interactive_explainer(
     project_dir: str,
     provider: str = "gemini",
     model_name: Optional[str] = None,
-    ollama_host: str = "http://localhost:11434"
+    ollama_host: str = "http://localhost:11434",
+    max_steps: int = 60
 ) -> None:
     """
     Start the interactive codebase explainer REPL session.
@@ -148,7 +149,8 @@ def run_interactive_explainer(
         f"Project Path : [yellow]{proj_path}[/yellow]\n"
         f"Provider     : [green]{provider}[/green]\n"
         f"Model        : [green]{model_name}[/green]\n"
-        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file[/blue]\n\n"
+        f"Max Steps/Turn: [yellow]{max_steps}[/yellow]\n"
+        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, list_project_structure[/blue]\n\n"
         f"[bold white]Available Shortcuts:[/bold white]\n"
         f"  [cyan]/overview[/cyan]           - Summarize codebase architecture, key components & entry points\n"
         f"  [cyan]/explore <symbol>[/cyan]   - Deep dive into a class, struct, or interface\n"
@@ -192,7 +194,7 @@ def run_interactive_explainer(
         if user_input.lower() == "/help":
             console.print(Panel(
                 "[bold cyan]Interactive Explainer Help & Commands[/bold cyan]\n\n"
-                "• [bold]/overview[/bold]: Inspects CMakeLists.txt and headers to give a full architectural tour.\n"
+                "• [bold]/overview[/bold]: Inspects project layout and CMake to provide an architectural tour.\n"
                 "• [bold]/explore <symbol>[/bold]: Deeply analyzes a class, its members, inheritance, and usages.\n"
                 "• [bold]/flow <function>[/bold]: Traces execution call trees and data flow.\n"
                 "• [bold]/clear[/bold]: Resets context memory for a brand new topic.\n"
@@ -204,9 +206,10 @@ def run_interactive_explainer(
         # Transform slash command shorthands into targeted prompts
         if user_input.startswith("/overview"):
             effective_prompt = (
-                "Please investigate the project structure, CMakeLists.txt, and key header files. "
-                "Provide a comprehensive, easy-to-understand architectural overview of the codebase, "
-                "highlighting the main components, their responsibilities, and how they interact."
+                "Please give a comprehensive architectural overview of this codebase.\n"
+                "1. Start by calling 'list_project_structure' and reading 'CMakeLists.txt' (or top-level build config).\n"
+                "2. Inspect the key header files in the core modules.\n"
+                "3. Explain the main components, their responsibilities, and how data/control flows between them."
             )
         elif user_input.startswith("/explore"):
             symbol = user_input[len("/explore"):].strip()
@@ -243,7 +246,7 @@ def run_interactive_explainer(
         assistant_reply = ""
 
         try:
-            for step in app.stream(current_state, {"recursion_limit": 25}, stream_mode="updates"):
+            for step in app.stream(current_state, {"recursion_limit": max_steps}, stream_mode="updates"):
                 for node_name, node_update in step.items():
                     if node_name == "agent":
                         msg = node_update["messages"][-1]
@@ -262,7 +265,16 @@ def run_interactive_explainer(
                                 preview += "..."
                             console.print(f"[dim]    ↳ Result: {escape(preview)}[/dim]")
         except Exception as e:
-            console.print(f"[red]Error during agent processing: {e}[/red]")
+            # If recursion limit is reached or interrupted, request model to synthesize from gathered context
+            console.print(f"[dim yellow]  (Exploration reached turn limit of {max_steps} steps; compiling summary...)[/dim yellow]")
+            try:
+                summary_prompt = HumanMessage(content="Please synthesize your complete architectural explanation now based on all the files and symbols you explored above.")
+                recovery_messages = conversation_history + [summary_prompt]
+                final_response = llm.invoke(recovery_messages)
+                assistant_reply = extract_text(final_response.content)
+                conversation_history.append(final_response)
+            except Exception as final_e:
+                assistant_reply = f"Exploration completed. (Encountered: {e})"
 
         # Render assistant response with rich markdown
         console.print("\n" + "─"*80)
@@ -303,6 +315,12 @@ def parse_args():
         default="http://localhost:11434",
         help="Ollama host URL (default: http://localhost:11434)"
     )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=60,
+        help="Maximum tool execution steps per interaction turn (default: 60)"
+    )
     return parser.parse_args()
 
 
@@ -312,5 +330,6 @@ if __name__ == "__main__":
         project_dir=args.project_dir,
         provider=args.provider,
         model_name=args.model,
-        ollama_host=args.ollama_host
+        ollama_host=args.ollama_host,
+        max_steps=args.max_steps
     )

@@ -1,0 +1,6 @@
+{
+  "pid": 31255,
+  "socketPath": "/tmp/clangd-query-d7d49a266cf8e07c239a8743f494f3ed.sock",
+  "buildTime": 1787288897,
+  "projectRoot": "/root/Projects/codereviewagent/sample_project"
+}
