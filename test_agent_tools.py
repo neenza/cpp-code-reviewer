@@ -1,19 +1,31 @@
 import os
 import unittest
 from pathlib import Path
-from code_review_agent import (
+
+# Shared Tools
+from cpp_agent_tools import (
     clangd_query,
     ripgrep_search,
     read_project_file,
-    record_finding,
     set_active_project_dir,
+    COMMON_CPP_TOOLS
+)
+
+# Review Agent
+from code_review_agent import (
+    record_finding,
     build_repo_review_orchestrator,
     _RECORDED_FINDINGS,
     MODULE_AUDIT_TOOLS
 )
+
+# Explainer Agent
+from code_explainer_agent import build_explainer_graph
+
 from langchain_core.messages import AIMessage
 
-class TestCodeReviewTools(unittest.TestCase):
+
+class TestCodeReviewAndExplainerTools(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sample_dir = Path(__file__).parent / "sample_project"
@@ -58,7 +70,7 @@ class TestCodeReviewTools(unittest.TestCase):
         self.assertIn("CRITICAL_FLAW", res)
         self.assertTrue(any(f["title"] == "Buffer overflow in SessionManager" for f in _RECORDED_FINDINGS))
 
-    def test_orchestrator_compilation(self):
+    def test_review_orchestrator_compilation(self):
         class DummyLLM:
             def bind_tools(self, tools):
                 return self
@@ -67,6 +79,20 @@ class TestCodeReviewTools(unittest.TestCase):
 
         graph = build_repo_review_orchestrator(llm=DummyLLM())
         self.assertIsNotNone(graph)
+
+    def test_explainer_graph_compilation(self):
+        class DummyLLM:
+            def bind_tools(self, tools):
+                return self
+            def invoke(self, messages):
+                return AIMessage(content="Here is how the architecture works.")
+
+        graph = build_explainer_graph(llm=DummyLLM(), tools=COMMON_CPP_TOOLS)
+        self.assertIsNotNone(graph)
+        result = graph.invoke({"messages": [{"role": "user", "content": "Explain OrderRepository"}]})
+        self.assertIn("messages", result)
+        self.assertEqual(result["messages"][-1].content, "Here is how the architecture works.")
+
 
 if __name__ == "__main__":
     unittest.main()

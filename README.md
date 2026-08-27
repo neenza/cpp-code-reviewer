@@ -1,27 +1,33 @@
-# Autonomous C++ Code Review Agent in python
+# Autonomous & Interactive C++ Codebase Agents
 
-An autonomous C++ Code Review Agent built with **LangGraph**, **Ollama**, and **Google Gemini API**, leveraging deep C++ semantic understanding via **`clangd-query`** and fast regex search via **`ripgrep` (`rg`)**.
+A modular suite of intelligent C++ engineering agents built with **LangGraph**, **Ollama**, and **Google Gemini API**, leveraging deep AST semantic code intelligence via **`clangd-query`** and fast regex search via **`ripgrep` (`rg`)**.
 
 ---
 
-## Key Features
+## 🛠️ Agents Overview
 
-1. **Systematic Autonomous Analysis Loop**:
-   - Begins analysis by parsing `CMakeLists.txt` to discover build targets, compilation standards, include paths, and external dependencies.
-   - Systematically navigates code using semantic AST understanding and fast codebase search.
-2. **Specialized Tools**:
-   - **`clangd-query`**: Semantic AST code intelligence (`search`, `show`, `usages`, `hierarchy`, `signature`, `interface`).
-   - **`ripgrep` (`rg`)**: High-performance regex text search for memory management keywords (`malloc`, `free`, `new`, `delete`, `strcpy`), concurrency primitives, and raw pointer patterns.
-   - **`read_project_file`**: Context-bounded file reader for build configurations and source files.
-   - **`record_finding`**: Incremental review findings recorder that writes observations step-by-step into persistent state and `.draft_review_findings.json` as exploration happens (ideal for scaling to 50+ files without context memory limits).
-3. **Multi-Model Support**:
-   - **Ollama**: Run offline/locally with models such as `llama3.1:8b`, `qwen2.5:14b`, `qwen2.5:32b`, `qwen3.6:27b`.
-   - **Google Gemini API**: Seamless fallback/testing mode using `gemini-2.5-flash` or `gemini-1.5-pro` when local GPU/Ollama is not available.
-4. **Structured 4-Part Review Output**:
-   - Project Architecture & Dependency Overview
-   - What is implemented exceptionally well (RAII, Modern C++ idioms, concurrency safety)
-   - What needs minor improvements (pass-by-value, magic numbers, missing virtual destructors)
-   - Poor implementations & critical flaws (Use-After-Free, buffer overflows, data races, Rule of 3/5 violations)
+### 1. Autonomous C++ Code Review Agent (`code_review_agent.py`)
+- **Purpose**: Autonomous, exhaustive code review across 100+ file codebases without conversational context fatigue.
+- **Architecture**: Deterministic multi-node Map-Reduce orchestrator (Planning $\rightarrow$ Module-by-Module Audit $\rightarrow$ Final Synthesis).
+- **Output**: Generates a structured 4-part Code Review Report (`CPP_CODE_REVIEW_REPORT.md`).
+
+### 2. Interactive Codebase Explainer & Tutor (`code_explainer_agent.py`)
+- **Purpose**: Dedicated **interactive guide** whose sole job is to help developers deeply understand an existing codebase.
+- **Behavior**: Does **not** write new code, debug, or write documentation files. Instead, it investigates how pieces fit together, answers technical questions with exact code citations (`file:line`), traces call chains, and **progressively adapts explanations** to the user's level of understanding.
+- **Built-in Shortcuts**:
+  - `/overview` - Summarizes architecture, components, and entry points.
+  - `/explore <Symbol>` - Deep dive into a class/struct (members, inheritance, usages).
+  - `/flow <Function>` - Traces end-to-end execution flow and call hierarchy.
+  - `/clear` - Clears conversational context for a fresh topic.
+  - `/help` - Shows command tips.
+  - `/exit` or `quit` - Exits the interactive session.
+
+### 3. Shared C++ Tools Module (`cpp_agent_tools.py`)
+- Centralized reusable toolset powering any future C++ agents:
+  - **`clangd_query`**: Semantic AST code intelligence (`search`, `show`, `usages`, `hierarchy`, `signature`, `interface`).
+  - **`ripgrep_search`**: High-performance regex text search for memory management keywords (`malloc`, `free`, `new`, `delete`, `strcpy`), concurrency primitives, and raw pointer patterns.
+  - **`read_project_file`**: Bounded file reader with line range slicing.
+  - **`get_llm`**: Multi-model factory supporting local/offline Ollama and Google Gemini.
 
 ---
 
@@ -29,12 +35,14 @@ An autonomous C++ Code Review Agent built with **LangGraph**, **Ollama**, and **
 
 ```
 codereviewagent/
-├── code_review_agent.py      # Main autonomous LangGraph agent script & CLI
-├── test_agent_tools.py       # Unit tests for clangd-query, ripgrep, and LangGraph
-├── AGENT.md                  # Detailed clangd-query specifications & usage guidelines
-├── README.md                 # Documentation
-├── .env.example              # Environment variables template
-└── sample_project/           # Test C++ project with intentional good/bad patterns
+├── cpp_agent_tools.py         # Shared C++ tools (clangd-query, ripgrep, file reader, LLM factory)
+├── code_review_agent.py       # Autonomous code review orchestrator (Map-Reduce)
+├── code_explainer_agent.py    # Interactive codebase explainer & tutor REPL
+├── test_agent_tools.py        # Unit test suite verifying tools & agents
+├── AGENT.md                   # Detailed clangd-query specifications & usage guidelines
+├── README.md                  # Documentation
+├── .env.example               # Environment variables template
+└── sample_project/            # Test C++ project with intentional patterns
     ├── CMakeLists.txt
     ├── compile_commands.json
     ├── include/
@@ -78,25 +86,29 @@ cp .env.example .env
 
 ---
 
-## Running the Agent
+## Usage Guide
 
-### A. Testing with Google Gemini API
+### 🚀 Running the Interactive Codebase Explainer
 ```bash
+# Using Google Gemini API:
+python code_explainer_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
+
+# Using Local/Offline Ollama:
+python code_explainer_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project
+```
+
+### 🔍 Running the Autonomous Code Reviewer
+```bash
+# Using Google Gemini API:
 python code_review_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
+
+# Using Local/Offline Ollama:
+python code_review_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project
 ```
 
-### B. Running with Local Ollama
-```bash
-# Ensure Ollama server is running (e.g. `ollama serve`)
-python code_review_agent.py --provider ollama --model llama3.1:8b --project-dir sample_project
-```
+---
 
-You can also specify a custom Ollama host:
-```bash
-python code_review_agent.py --provider ollama --model qwen2.5:14b --ollama-host http://192.168.1.100:11434 --project-dir /path/to/cpp/project
-```
-
-### CLI Options
+## CLI Options
 
 | Argument | Description | Default |
 |---|---|---|
@@ -104,16 +116,14 @@ python code_review_agent.py --provider ollama --model qwen2.5:14b --ollama-host 
 | `--provider` | LLM backend: `gemini`, `google`, or `ollama` | `gemini` |
 | `--model`, `-m` | Model name (e.g., `gemini-3.5-flash-lite`, `llama3.1:8b`, `qwen2.5:14b`) | `gemini-3.5-flash-lite` |
 | `--ollama-host` | URL of the Ollama server | `http://localhost:11434` |
-| `--ignore-dirs` | Comma-separated list of directories to ignore (e.g. `third_party,external,vendor,tests`) | Built-in third-party exclusions |
-| `--output`, `-o` | Output Markdown report file path | `<project-dir>/CPP_CODE_REVIEW_REPORT.md` |
-| `--max-steps` | Maximum LangGraph execution recursion steps | `500` |
+| `--ignore-dirs` | Comma-separated directories to ignore during audit (`code_review_agent.py`) | Built-in third-party exclusions |
+| `--max-steps` | Maximum recursion steps per module (`code_review_agent.py`) | `300` |
 
 ---
 
 ## Running Unit Tests
 
-Run the test suite verifying `clangd-query`, `ripgrep`, and LangGraph state graph mechanics:
+Run the test suite verifying `clangd-query`, `ripgrep`, shared tools, and LangGraph agent graphs:
 ```bash
 ./venv/bin/python3 test_agent_tools.py
 ```
-
