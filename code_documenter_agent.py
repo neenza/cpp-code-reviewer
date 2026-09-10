@@ -258,6 +258,14 @@ CORE INSTRUCTIONS & STANDARDS:
 4. 🧠 CONTEXT EFFICIENCY (32k LIMIT):
    - Keep tool queries targeted and focused.
    - Call `append_documentation_section` immediately after auditing each class or module.
+5. 📊 DIAGRAMS & FLOWCHARTS (MERMAID ONLY):
+   - Whenever illustrating architecture, class relationships, state transitions, or execution flows, you MUST use Mermaid diagrams ONLY inside fenced code blocks (` ```mermaid ... ``` `).
+   - Do NOT use ASCII art, plain text boxes, or pseudo-code drawings for diagrams.
+   - Supported Mermaid types:
+     * `flowchart TD` or `flowchart LR` for component architectures and control/data flows.
+     * `classDiagram` for class inheritance, interfaces, and member variables.
+     * `sequenceDiagram` for function call sequences and inter-object messaging.
+   - Ensure valid Mermaid syntax: quote node labels containing special characters (parentheses, braces, brackets), e.g. `id["OrderRepository (Thread-Safe)"]`.
 ════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -448,7 +456,7 @@ def document_module_node_factory(llm, max_context_tokens: int = 32000, module_ma
             f"1. Use 'clangd_query' ('interface', 'show', 'hierarchy', 'signature') on the classes/structs/functions in this module.\n"
             f"2. Use 'ripgrep_search' if needed to trace threading primitives (mutex, shared_mutex) and memory ownership (unique_ptr, shared_ptr).\n"
             f"3. Call 'append_documentation_section' to write the documentation for this module directly to disk.\n"
-            f"   Include: Role & Purpose, Public API Reference, Member Variables, Concurrency/Thread-Safety Guarantees, and Design Idioms.\n"
+            f"   Include: Role & Purpose, Public API Reference, Member Variables, Concurrency/Thread-Safety Guarantees, Design Idioms, and Mermaid diagrams (strictly Mermaid only, never ASCII art) for class relationships or workflows.\n"
             f"4. Once you have appended the section using 'append_documentation_section', conclude your module work."
         )
 
