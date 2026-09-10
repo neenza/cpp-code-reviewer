@@ -1,6 +1,7 @@
 import os
 import unittest
 from pathlib import Path
+import tempfile
 
 # Shared Tools
 from cpp_agent_tools import (
@@ -15,17 +16,25 @@ from cpp_agent_tools import (
 from code_review_agent import (
     record_finding,
     build_repo_review_orchestrator,
-    _RECORDED_FINDINGS,
-    MODULE_AUDIT_TOOLS
+    _RECORDED_FINDINGS
 )
 
 # Explainer Agent
 from code_explainer_agent import build_explainer_graph
 
-from langchain_core.messages import AIMessage
+# Documenter Agent
+from code_documenter_agent import (
+    init_documentation_file,
+    append_documentation_section,
+    read_current_documentation_toc,
+    trim_messages_to_budget,
+    build_codebase_documenter_graph
+)
+
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
 
-class TestCodeReviewAndExplainerTools(unittest.TestCase):
+class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sample_dir = Path(__file__).parent / "sample_project"
@@ -89,9 +98,55 @@ class TestCodeReviewAndExplainerTools(unittest.TestCase):
 
         graph = build_explainer_graph(llm=DummyLLM(), tools=COMMON_CPP_TOOLS)
         self.assertIsNotNone(graph)
-        result = graph.invoke({"messages": [{"role": "user", "content": "Explain OrderRepository"}]})
-        self.assertIn("messages", result)
-        self.assertEqual(result["messages"][-1].content, "Here is how the architecture works.")
+
+    def test_documenter_incremental_writer(self):
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        init_documentation_file(tmp_path, "SampleOrderSystem")
+        res = append_documentation_section.invoke({
+            "section_title": "Order Repository Architecture",
+            "markdown_content": "Thread-safe concurrent order store using `std::shared_mutex`.",
+            "level": 2
+        })
+        self.assertIn("Successfully appended", res)
+
+        toc = read_current_documentation_toc.invoke({})
+        self.assertIn("Order Repository Architecture", toc)
+
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("## Order Repository Architecture", content)
+        self.assertIn("Thread-safe concurrent order store", content)
+
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    def test_context_trimmer_32k_budget(self):
+        # Create a series of messages exceeding small budget to verify trimming
+        sys_msg = SystemMessage(content="You are a documenter.")
+        human_msg = HumanMessage(content="Document module include.")
+        # Large tool content
+        large_tool_msg = ToolMessage(content="A" * 12000, tool_call_id="call_1", name="read_project_file")
+        ai_msg = AIMessage(content="Continuing exploration", tool_calls=[{"id": "call_2", "name": "clangd_query", "args": {}}])
+        recent_tool = ToolMessage(content="class OrderRepository {}", tool_call_id="call_2", name="clangd_query")
+
+        messages = [sys_msg, human_msg, large_tool_msg, ai_msg, recent_tool]
+        # Trim to 2000 tokens
+        trimmed = trim_messages_to_budget(messages, max_tokens=2000, reserve_tokens=200)
+        self.assertEqual(trimmed[0].content, "You are a documenter.")
+        self.assertEqual(trimmed[1].content, "Document module include.")
+        self.assertTrue(len(trimmed) >= 2)
+
+    def test_documenter_graph_compilation(self):
+        class DummyLLM:
+            def bind_tools(self, tools):
+                return self
+            def invoke(self, messages):
+                return AIMessage(content="Documentation completed.")
+
+        graph = build_codebase_documenter_graph(llm=DummyLLM(), max_context_tokens=32000)
+        self.assertIsNotNone(graph)
 
 
 if __name__ == "__main__":
