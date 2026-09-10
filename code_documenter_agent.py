@@ -269,6 +269,7 @@ CORE INSTRUCTIONS & STANDARDS:
 class DocumenterState(TypedDict):
     project_dir: str
     output_file: str
+    target_dirs: Optional[List[str]]
     all_files: List[str]
     modules: List[str]
     module_files_map: Dict[str, List[str]]
@@ -281,6 +282,8 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     """
     Node 1: Explore project directories and CMake configuration,
     plan documentation layout, and initialize the output Markdown file.
+    If target_dirs is specified, only those folders are queued for documentation,
+    while other folders remain accessible for reference/exploration by tools.
     """
     proj_path = get_active_project_dir()
     out_file = Path(state["output_file"]).resolve()
@@ -289,11 +292,9 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
 
     init_documentation_file(out_file, proj_path.name)
 
-    # Exclude vendor and build artifacts
+    # Exclude build and cache artifacts
     ignored = {
-        "build", ".cache", ".git", ".vscode", ".idea",
-        "third_party", "thirdparty", "external", "vendor",
-        "deps", "_deps", "vcpkg_installed", "conan", "submodules"
+        "build", ".cache", ".git", ".vscode", ".idea"
     }
 
     def is_ignored(p: Path) -> bool:
@@ -313,9 +314,28 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
 
     sorted_modules = sorted(list(module_map.keys()))
 
-    console.print(f"[green]Discovered {len(all_files)} C++ files across {len(sorted_modules)} directories/modules.[/green]")
+    console.print(f"[green]Discovered {len(all_files)} total C++ files across {len(sorted_modules)} directories/modules.[/green]")
     for mod in sorted_modules:
         console.print(f"  📁 [bold]{escape(mod)}/[/bold] ({len(module_map[mod])} files)")
+
+    # Check for target_dirs filter
+    target_dirs = state.get("target_dirs")
+    modules_to_document = sorted_modules
+    if target_dirs:
+        norm_targets = [t.strip().strip("/").lower() for t in target_dirs if t.strip()]
+        filtered = []
+        for m in sorted_modules:
+            m_lower = m.strip().strip("/").lower()
+            if any(m_lower == t or m_lower.startswith(t + "/") or t.startswith(m_lower + "/") for t in norm_targets):
+                filtered.append(m)
+        if filtered:
+            modules_to_document = filtered
+            console.print(f"\n[bold green]Target Filter Applied:[/bold green] Queued {len(modules_to_document)} module(s) under [{', '.join(norm_targets)}] for documentation:")
+            for mod in modules_to_document:
+                console.print(f"  🎯 [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files)")
+            console.print("[dim]Note: Unselected/third-party folders can still be queried by clangd-query/rg for references if needed.[/dim]\n")
+        else:
+            console.print(f"[yellow]Warning: No modules matched target directories: {target_dirs}. Documenting all discovered modules.[/yellow]")
 
     # Read CMakeLists.txt to build Section 1
     cmakelists = proj_path / "CMakeLists.txt"
@@ -330,11 +350,20 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     # Append Section 1: Architecture & Project Structure
     sec1_content = (
         f"### Overview\n"
-        f"This project contains **{len(all_files)} primary source files** organized into **{len(sorted_modules)} modules**.\n\n"
-        f"### Directory & Module Layout\n"
+        f"This repository contains **{len(all_files)} C++ files** across **{len(sorted_modules)} directories**.\n"
     )
+    if target_dirs and len(modules_to_document) < len(sorted_modules):
+        sec1_content += (
+            f"> **Documentation Scope**: Detailed documentation is generated specifically for: `{', '.join(target_dirs)}` "
+            f"({len(modules_to_document)} target modules). External and vendor folders are referenced where needed but omitted from dedicated chapters.\n\n"
+        )
+    else:
+        sec1_content += "\n"
+
+    sec1_content += "### Directory & Module Layout\n"
     for mod in sorted_modules:
-        sec1_content += f"- **`{mod}/`** ({len(module_map[mod])} files):\n"
+        marker = "🎯 *(Documented)*" if mod in modules_to_document else "📦 *(Reference)*"
+        sec1_content += f"- **`{mod}/`** ({len(module_map[mod])} files) {marker}:\n"
         for f in module_map[mod][:8]:
             sec1_content += f"  - `{Path(f).name}`\n"
         if len(module_map[mod]) > 8:
@@ -351,7 +380,7 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
 
     return {
         "all_files": all_files,
-        "modules": sorted_modules,
+        "modules": modules_to_document,
         "module_files_map": module_map,
         "current_module_index": 0,
         "sections_count": 1
@@ -536,7 +565,8 @@ def run_codebase_documenter(
     model_name: Optional[str] = None,
     ollama_host: str = "http://localhost:11434",
     max_context_tokens: int = 32000,
-    module_max_steps: int = 50
+    module_max_steps: int = 50,
+    target_dirs: Optional[List[str]] = None
 ) -> Path:
     """
     Execute the autonomous codebase documentation agent loop.
@@ -560,9 +590,12 @@ def run_codebase_documenter(
         else:
             model_name = "gemini-3.5-flash-lite"
 
+    target_display = f"[cyan]{', '.join(target_dirs)}[/cyan]" if target_dirs else "[yellow]All repository modules[/yellow]"
+
     console.print(Panel(
         f"[bold cyan]Autonomous C++ Codebase Documentation Agent[/bold cyan]\n"
         f"Project Path    : [yellow]{proj_path}[/yellow]\n"
+        f"Target Scope    : {target_display}\n"
         f"Output Document : [green]{out_file}[/green]\n"
         f"Provider        : [green]{provider}[/green]\n"
         f"Model           : [green]{model_name}[/green]\n"
@@ -583,6 +616,7 @@ def run_codebase_documenter(
     initial_state: DocumenterState = {
         "project_dir": str(proj_path),
         "output_file": str(out_file),
+        "target_dirs": target_dirs,
         "all_files": [],
         "modules": [],
         "module_files_map": {},
@@ -597,13 +631,20 @@ def run_codebase_documenter(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Autonomous C++ Codebase Documentation Agent with 32k context limit and incremental Markdown generation."
+        description="Autonomous C++ Codebase Documentation Agent with 32k context limit, target folder scoping, and incremental Markdown generation."
     )
     parser.add_argument(
         "--project-dir", "-p",
         type=str,
         default="./sample_project",
         help="Path to the C++ project directory (default: ./sample_project)"
+    )
+    parser.add_argument(
+        "--target-dirs", "--include-dirs",
+        type=str,
+        default=None,
+        help="Comma-separated list of folders/directories to generate documentation for (e.g. 'src,include' or 'src/engine'). "
+             "Other folders (such as third_party or vendor) can still be explored and referenced by tools, but won't be documented."
     )
     parser.add_argument(
         "--output", "-o",
@@ -647,6 +688,10 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    targets = None
+    if args.target_dirs:
+        targets = [d.strip() for d in args.target_dirs.split(",") if d.strip()]
+
     run_codebase_documenter(
         project_dir=args.project_dir,
         output_path=args.output,
@@ -654,5 +699,6 @@ if __name__ == "__main__":
         model_name=args.model,
         ollama_host=args.ollama_host,
         max_context_tokens=args.max_context_tokens,
-        module_max_steps=args.max_steps
+        module_max_steps=args.max_steps,
+        target_dirs=targets
     )

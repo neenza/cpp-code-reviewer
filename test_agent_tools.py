@@ -148,6 +148,31 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
         graph = build_codebase_documenter_graph(llm=DummyLLM(), max_context_tokens=32000)
         self.assertIsNotNone(graph)
 
+    def test_documenter_target_dirs_filtering(self):
+        from code_documenter_agent import doc_discover_and_plan_node
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        state = {
+            "project_dir": str(self.sample_dir),
+            "output_file": str(tmp_path),
+            "target_dirs": ["include"],
+            "all_files": [],
+            "modules": [],
+            "module_files_map": {},
+            "current_module_index": 0,
+            "sections_count": 0,
+            "max_context_tokens": 32000
+        }
+        res = doc_discover_and_plan_node(state)
+        # Should only queue 'include', not 'src'
+        self.assertEqual(res["modules"], ["include"])
+        # But all_files still has the full project files for tool exploration
+        self.assertTrue(any("src/" in f for f in res["all_files"]))
+
+        if tmp_path.exists():
+            tmp_path.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

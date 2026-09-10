@@ -98,11 +98,14 @@ cp .env.example .env
 
 ### 📖 Running the Autonomous Codebase Documenter (32k Context Limit)
 ```bash
-# Using Google Gemini:
+# Using Google Gemini (document all core modules):
 python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
 
+# Documenting only specific target folders (ignoring third-party/vendor from documentation output):
+python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir /path/to/cpp_project --target-dirs "src,include"
+
 # Using Local/Offline Ollama with custom context limit:
-python code_documenter_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project --max-context-tokens 32000
+python code_documenter_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project --max-context-tokens 32000 --target-dirs "src/core,src/engine"
 ```
 
 ### 🚀 Running the Interactive Codebase Explainer
@@ -130,6 +133,7 @@ python code_review_agent.py --provider ollama --model llama3.1:8b --project-dir 
 | Argument | Description | Default |
 |---|---|---|
 | `--project-dir`, `-p` | Path to the target C++ codebase | `./sample_project` |
+| `--target-dirs`, `--include-dirs` | Comma-separated folders to generate documentation for (e.g. `src,include`). External/vendor code can still be accessed by tools for reference, but won't be documented. | All discovered modules |
 | `--output`, `-o` | Output Markdown file path | `<project-dir>/CODEBASE_DOCUMENTATION.md` or `CPP_CODE_REVIEW_REPORT.md` |
 | `--provider` | LLM backend: `gemini`, `google`, or `ollama` | `gemini` |
 | `--model`, `-m` | Model name (e.g., `gemini-3.5-flash-lite`, `llama3.1:8b`, `qwen2.5:14b`) | `gemini-3.5-flash-lite` |
