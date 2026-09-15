@@ -243,6 +243,48 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
         if tmp_path.exists():
             tmp_path.unlink()
 
+    def test_document_module_node_guaranteed_append(self):
+        from code_documenter_agent import document_module_node_factory, init_documentation_file, _DOCUMENTED_SECTIONS
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        init_documentation_file(tmp_path, "TestModuleAppend")
+
+        # Dummy LLM that returns text without calling append_documentation_section tool
+        class DirectTextLLM:
+            def bind_tools(self, tools):
+                return self
+            def invoke(self, messages):
+                return AIMessage(content="### Functional Explanation for src\nThe `src` module contains main.cpp which orchestrates the order processing loop and initializes repository storage.")
+
+        node_fn = document_module_node_factory(llm=DirectTextLLM(), max_context_tokens=32000, module_max_steps=5)
+        state = {
+            "project_dir": str(self.sample_dir),
+            "output_file": str(tmp_path),
+            "target_dirs": None,
+            "ignore_dirs": None,
+            "all_files": ["src/main.cpp"],
+            "modules": ["src"],
+            "module_files_map": {"src": ["src/main.cpp"]},
+            "current_module_index": 0,
+            "sections_count": 0,
+            "max_context_tokens": 32000
+        }
+
+        res = node_fn(state)
+        self.assertEqual(res["current_module_index"], 1)
+        self.assertGreater(len(_DOCUMENTED_SECTIONS), 0)
+
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Check that the section was saved automatically even though the model didn't call the tool
+        self.assertIn("Src - Functional Architecture & Implementation", content)
+        self.assertIn("main.cpp which orchestrates the order processing loop", content)
+
+        if tmp_path.exists():
+            tmp_path.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

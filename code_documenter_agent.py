@@ -527,7 +527,8 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
 
 def document_module_node_factory(llm, max_context_tokens: int = 32000, module_max_steps: int = 50):
     """
-    Create document_module node with 32k context limitation, step control, and functional focus.
+    Create document_module node with 32k context limitation, step control, functional focus,
+    and guaranteed section appending fallback.
     """
     sub_agent = build_module_documenter_runner(llm, max_context_tokens=max_context_tokens)
 
@@ -547,7 +548,7 @@ def document_module_node_factory(llm, max_context_tokens: int = 32000, module_ma
             f"2. FOCUS ON FUNCTIONAL BEHAVIOR: Explain what this module actually does in practice, how its algorithms work, and what role it plays in the overall system.\n"
             f"3. EXPLAIN CODE PARTS & LOGIC: Detail key methods, input parameters, transformations, concurrency locks (mutex/shared_mutex), return types, and error handling.\n"
             f"4. Add a Mermaid sequence or flowchart diagram (strictly Mermaid only, never ASCII art) illustrating the runtime execution flow or class interactions.\n"
-            f"5. Call 'append_documentation_section' to save the section to disk.\n"
+            f"5. MANDATORY FINAL STEP: You MUST call the 'append_documentation_section' tool to write your documentation to disk.\n"
             f"   IMPORTANT: For 'section_title', provide only a descriptive title (e.g. '{current_module.replace('/', ' ').title()} - Functional Architecture & Implementation'). "
             f"   DO NOT include section numbers; numbering is managed automatically in sequence.\n"
             f"6. Conclude once 'append_documentation_section' has been called."
@@ -560,30 +561,79 @@ def document_module_node_factory(llm, max_context_tokens: int = 32000, module_ma
             ]
         }
 
+        sections_before = len(_DOCUMENTED_SECTIONS)
+        last_assistant_content = ""
+        conversation_history: List[BaseMessage] = list(sub_state["messages"])
+
         try:
             for step in sub_agent.stream(sub_state, {"recursion_limit": module_max_steps}, stream_mode="updates"):
                 for node_name, node_update in step.items():
                     if node_name == "agent":
                         msg = node_update["messages"][-1]
+                        conversation_history.append(msg)
+                        raw_text = extract_text(msg.content).strip()
+                        if raw_text:
+                            last_assistant_content = raw_text
                         if msg.tool_calls:
                             for tc in msg.tool_calls:
                                 console.print(f"  [magenta]▶ Tool:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})")
                     elif node_name == "tools":
                         for msg in node_update["messages"]:
+                            conversation_history.append(msg)
                             raw_text = extract_text(msg.content)
                             preview = raw_text[:120].replace("\n", " ")
                             if len(raw_text) > 120:
                                 preview += "..."
                             console.print(f"[dim]    ↳ Result: {escape(preview)}[/dim]")
         except Exception as e:
-            console.print(f"[dim yellow]  (Module '{escape(current_module)}' documentation completed or reached step budget: {e})[/dim yellow]")
+            console.print(f"[dim yellow]  (Module exploration step ended: {e})[/dim yellow]")
+
+        # GUARANTEED APPEND CHECK: Verify if a section was actually written for this module
+        if len(_DOCUMENTED_SECTIONS) == sections_before:
+            clean_module_title = f"{current_module.replace('/', ' ').title()} - Functional Architecture & Implementation"
+
+            # Case A: Agent provided documentation directly in assistant text without calling the tool
+            if len(last_assistant_content) > 150:
+                console.print(f"  [bold yellow]⚡ Agent provided documentation directly in text; auto-saving section...[/bold yellow]")
+                append_documentation_section.invoke({
+                    "section_title": clean_module_title,
+                    "markdown_content": last_assistant_content,
+                    "level": 2
+                })
+            else:
+                # Case B: Agent only explored or did not generate text; run guaranteed direct synthesis
+                console.print(f"  [bold yellow]⚡ Running guaranteed documentation synthesis for module '{escape(current_module)}'...[/bold yellow]")
+                try:
+                    synth_messages = trim_messages_to_budget(
+                        conversation_history + [
+                            HumanMessage(content=(
+                                f"Based on the files and code explored above for module '{current_module}', "
+                                f"write comprehensive, publication-grade functional Markdown documentation now.\n"
+                                f"Explain what the code does in practice, key methods breakdown, inputs/outputs, concurrency, "
+                                f"and include a Mermaid diagram (strictly Mermaid only)."
+                            ))
+                        ],
+                        max_tokens=max_context_tokens
+                    )
+                    synth_resp = llm.invoke(synth_messages)
+                    synth_content = extract_text(synth_resp.content).strip()
+                    if synth_content:
+                        append_documentation_section.invoke({
+                            "section_title": clean_module_title,
+                            "markdown_content": synth_content,
+                            "level": 2
+                        })
+                    else:
+                        console.print(f"[red]Warning: Synthesis returned empty text for module '{current_module}'.[/red]")
+                except Exception as synth_err:
+                    console.print(f"[red]Synthesis error for module '{current_module}': {synth_err}[/red]")
 
         pct = ((idx + 1) / len(modules)) * 100
         console.print(f"[green]✔ Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
 
         return {
             "current_module_index": idx + 1,
-            "sections_count": state.get("sections_count", 0) + 1
+            "sections_count": len(_DOCUMENTED_SECTIONS)
         }
 
     return document_module_node
