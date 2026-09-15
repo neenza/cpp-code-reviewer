@@ -116,7 +116,7 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
 
         with open(tmp_path, "r", encoding="utf-8") as f:
             content = f.read()
-        self.assertIn("## Order Repository Architecture", content)
+        self.assertIn("## 1. Order Repository Architecture", content)
         self.assertIn("Thread-safe concurrent order store", content)
 
         if tmp_path.exists():
@@ -169,6 +169,76 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
         self.assertEqual(res["modules"], ["include"])
         # But all_files still has the full project files for tool exploration
         self.assertTrue(any("src/" in f for f in res["all_files"]))
+
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    def test_documenter_ignore_dirs(self):
+        from code_documenter_agent import doc_discover_and_plan_node
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        state = {
+            "project_dir": str(self.sample_dir),
+            "output_file": str(tmp_path),
+            "target_dirs": None,
+            "ignore_dirs": ["include"],
+            "all_files": [],
+            "modules": [],
+            "module_files_map": {},
+            "current_module_index": 0,
+            "sections_count": 0,
+            "max_context_tokens": 32000
+        }
+        res = doc_discover_and_plan_node(state)
+        # 'include' should be completely ignored
+        self.assertNotIn("include", res["modules"])
+        self.assertIn("src", res["modules"])
+
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    def test_documenter_entry_point_topological_sort(self):
+        from code_documenter_agent import doc_discover_and_plan_node
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        state = {
+            "project_dir": str(self.sample_dir),
+            "output_file": str(tmp_path),
+            "target_dirs": None,
+            "ignore_dirs": None,
+            "all_files": [],
+            "modules": [],
+            "module_files_map": {},
+            "current_module_index": 0,
+            "sections_count": 0,
+            "max_context_tokens": 32000
+        }
+        res = doc_discover_and_plan_node(state)
+        # sample_project has main.cpp in 'src', so 'src' must be the starting point (index 0)
+        self.assertEqual(res["modules"][0], "src")
+
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    def test_automatic_sequential_section_numbering(self):
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        init_documentation_file(tmp_path, "TestSeq")
+        # Pass out of sequence or prefixed titles
+        append_documentation_section.invoke({"section_title": "Section 9: Core Engine", "markdown_content": "Engine logic."})
+        append_documentation_section.invoke({"section_title": "3. Data Storage", "markdown_content": "Storage logic."})
+        append_documentation_section.invoke({"section_title": "Networking API", "markdown_content": "Network logic."})
+
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Should be strictly numbered 1, 2, 3
+        self.assertIn("## 1. Core Engine", content)
+        self.assertIn("## 2. Data Storage", content)
+        self.assertIn("## 3. Networking API", content)
 
         if tmp_path.exists():
             tmp_path.unlink()

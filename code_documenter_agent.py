@@ -147,13 +147,17 @@ def trim_messages_to_budget(
 
 _DOC_OUTPUT_FILE: Path = Path("CODEBASE_DOCUMENTATION.md")
 _DOCUMENTED_SECTIONS: List[Dict[str, Any]] = []
+_MAIN_SECTION_COUNTER: int = 0
+_SUB_SECTION_COUNTER: int = 0
 
 
 def init_documentation_file(output_path: Path, project_name: str) -> None:
     """Initialize the Markdown documentation file with title and metadata."""
-    global _DOC_OUTPUT_FILE, _DOCUMENTED_SECTIONS
+    global _DOC_OUTPUT_FILE, _DOCUMENTED_SECTIONS, _MAIN_SECTION_COUNTER, _SUB_SECTION_COUNTER
     _DOC_OUTPUT_FILE = output_path.resolve()
     _DOCUMENTED_SECTIONS = []
+    _MAIN_SECTION_COUNTER = 0
+    _SUB_SECTION_COUNTER = 0
 
     header = (
         f"# {project_name} — Codebase Documentation\n\n"
@@ -177,15 +181,32 @@ def append_documentation_section(
     Call this tool as soon as you finish investigating a module, architectural component, or class hierarchy.
 
     Args:
-      section_title: Heading title for the section (e.g. 'OrderRepository & Concurrency Model')
-      markdown_content: Comprehensive markdown text explaining responsibilities, public APIs,
-                        member variables, concurrency/thread-safety, and relationships.
-      level: Header level (2 for '##', 3 for '###', default: 2)
+      section_title: Semantic title for the section WITHOUT ANY SECTION NUMBERS (e.g. 'Order Processing & Payment Workflow', 'SessionManager & Memory Safety').
+                     DO NOT include '1.' or 'Section 2' in the title; section numbering is automatically managed and sequenced for you.
+      markdown_content: Comprehensive markdown text explaining functional behavior, business logic,
+                        inner code mechanisms, public APIs, member variables, concurrency/thread-safety, and Mermaid diagrams.
+      level: Header level (2 for main sections '##', 3 for subsections '###', default: 2)
     """
-    global _DOC_OUTPUT_FILE, _DOCUMENTED_SECTIONS
+    global _DOC_OUTPUT_FILE, _DOCUMENTED_SECTIONS, _MAIN_SECTION_COUNTER, _SUB_SECTION_COUNTER
+
+    import re
+    # Strip any leading numbers, "Section X:", or Roman numerals the model may have generated
+    clean_title = re.sub(r'^(?:Section\s*)?(?:\d+[\.\-_:]\s*)+', '', section_title.strip(), flags=re.IGNORECASE).strip()
+    clean_title = re.sub(r'^(?:Section\s*)?[IVXLCDM]+[\.\-_:]\s*', '', clean_title, flags=re.IGNORECASE).strip()
+    if not clean_title:
+        clean_title = section_title.strip()
+
+    # Automatically generate strict, monotonic, sequential numbering
+    if level <= 2:
+        _MAIN_SECTION_COUNTER += 1
+        _SUB_SECTION_COUNTER = 0
+        numbered_title = f"{_MAIN_SECTION_COUNTER}. {clean_title}"
+    else:
+        _SUB_SECTION_COUNTER += 1
+        numbered_title = f"{_MAIN_SECTION_COUNTER}.{_SUB_SECTION_COUNTER} {clean_title}"
 
     prefix = "#" * max(1, min(level, 5))
-    formatted_chunk = f"{prefix} {section_title}\n\n{markdown_content.strip()}\n\n---\n\n"
+    formatted_chunk = f"{prefix} {numbered_title}\n\n{markdown_content.strip()}\n\n---\n\n"
 
     try:
         with open(_DOC_OUTPUT_FILE, "a", encoding="utf-8") as f:
@@ -193,14 +214,15 @@ def append_documentation_section(
             f.flush()
 
         _DOCUMENTED_SECTIONS.append({
-            "title": section_title,
+            "title": numbered_title,
+            "raw_title": clean_title,
             "level": level,
             "timestamp": time.time(),
             "preview": markdown_content[:120].replace("\n", " ")
         })
 
-        console.print(f"  [bold green]📝 Appended Section (Level {level}):[/bold green] [cyan]{escape(section_title)}[/cyan]")
-        return f"Successfully appended section '{section_title}' ({len(markdown_content)} chars) to documentation file. Total sections: {len(_DOCUMENTED_SECTIONS)}."
+        console.print(f"  [bold green]📝 Appended Section (Level {level}):[/bold green] [cyan]{escape(numbered_title)}[/cyan]")
+        return f"Successfully appended section '{numbered_title}' ({len(markdown_content)} chars) to documentation file. Total sections: {len(_DOCUMENTED_SECTIONS)}."
     except Exception as e:
         return f"Error writing to documentation file: {e}"
 
@@ -236,36 +258,38 @@ DOCUMENTER_TOOLS = [
 # ============================================================================
 
 DOCUMENTER_SYSTEM_PROMPT = """You are an expert Principal C++ Software Architect and Technical Writer.
-Your task is to generate clear, comprehensive, publication-grade Markdown documentation for the given C++ codebase.
+Your task is to generate clear, comprehensive, functional, publication-grade Markdown documentation for the given C++ codebase.
 
 ════════════════════════════════════════════════════════════════════════════════
 CORE INSTRUCTIONS & STANDARDS:
-1. 📂 INCREMENTAL OUTPUT (DO NOT BUFFER EVERYTHING):
-   - You MUST use `append_documentation_section` to write sections directly to disk as you investigate each component.
-   - Do NOT wait until the end of the entire project to write documentation.
-2. 🎯 TECHNICAL ACCURACY & CONCRETENESS:
-   - Always cite exact source files, classes, methods, and header paths (`include/order_repository.h`).
-   - Use `clangd_query` (`show`, `interface`, `hierarchy`, `signature`) to inspect real class definitions, constructors, and methods.
-   - Use `ripgrep_search` to verify threading primitives (`mutex`, `shared_mutex`, `atomic`) and resource ownership (`std::unique_ptr`, `std::shared_ptr`, RAII).
-3. 📐 STRUCTURAL REQUIREMENTS FOR COMPONENT DOCUMENTATION:
-   For each class/module, document:
-   - **Role & Purpose**: High-level responsibility in the system.
-   - **Public Interface & Key Methods**: Parameters, return values, semantics, and exceptions.
-   - **Member Variables & Data Layout**: Purpose of fields.
-   - **Concurrency & Thread-Safety**: Mutex locks, thread safety guarantees, reentrancy.
-   - **Design Patterns & Idioms**: RAII, PIMPL, Dependency Injection, Factory, Strategy.
-   - **Usage Example or Call Sequence**: How other components interact with it.
-4. 🧠 CONTEXT EFFICIENCY (32k LIMIT):
-   - Keep tool queries targeted and focused.
-   - Call `append_documentation_section` immediately after auditing each class or module.
-5. 📊 DIAGRAMS & FLOWCHARTS (MERMAID ONLY):
+1. 📂 INCREMENTAL OUTPUT & CLEAN TITLES:
+   - Call `append_documentation_section` as soon as you finish investigating each module or major workflow.
+   - DO NOT provide section numbers in `section_title` (e.g. do NOT write 'Section 2' or '3. ...').
+     Provide ONLY the descriptive semantic title (e.g. 'Order Processing Engine & Payment Workflow').
+     Section numbers are automatically tracked and prefixed for you in sequence.
+2. ⚙️ FOCUS ON FUNCTIONAL EXPLANATION & CODE INNER LOGIC:
+   - Do NOT just produce a dry list of class names and field types.
+   - Deeply explain WHAT the code does functionally: business logic, operational behavior, workflows, and state transitions.
+   - EXPLAIN THE CRITICAL PARTS OF THE CODE:
+     * Break down key algorithms and methods step-by-step.
+     * Explain input validations, data transformations, error handling, return codes, and side effects.
+     * Describe edge cases, failure recoveries, and performance considerations.
+     * Explain dynamic interactions: trace how caller functions pass data into methods and what downstream effects occur.
+3. 🎯 TECHNICAL ACCURACY & CONCRETENESS:
+   - Always cite exact source files, classes, methods, and line numbers (`include/order_repository.h`).
+   - Use `clangd_query` (`show`, `interface`, `hierarchy`, `signature`) to inspect actual implementations and method bodies.
+   - Use `ripgrep_search` to verify concurrency primitives (`mutex`, `shared_mutex`, `atomic`) and resource ownership (`std::unique_ptr`, `std::shared_ptr`, RAII).
+4. 📊 DIAGRAMS & FLOWCHARTS (MERMAID ONLY):
    - Whenever illustrating architecture, class relationships, state transitions, or execution flows, you MUST use Mermaid diagrams ONLY inside fenced code blocks (` ```mermaid ... ``` `).
    - Do NOT use ASCII art, plain text boxes, or pseudo-code drawings for diagrams.
    - Supported Mermaid types:
-     * `flowchart TD` or `flowchart LR` for component architectures and control/data flows.
-     * `classDiagram` for class inheritance, interfaces, and member variables.
-     * `sequenceDiagram` for function call sequences and inter-object messaging.
+     * `flowchart TD` or `flowchart LR` for functional data/control pipelines.
+     * `sequenceDiagram` for method call sequences and dynamic component interactions.
+     * `classDiagram` for class inheritance and interface relationships.
    - Ensure valid Mermaid syntax: quote node labels containing special characters (parentheses, braces, brackets), e.g. `id["OrderRepository (Thread-Safe)"]`.
+5. 🧠 CONTEXT EFFICIENCY (32k LIMIT):
+   - Keep tool queries targeted and focused.
+   - Append sections incrementally to keep the context window compact and clean.
 ════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -278,6 +302,7 @@ class DocumenterState(TypedDict):
     project_dir: str
     output_file: str
     target_dirs: Optional[List[str]]
+    ignore_dirs: Optional[List[str]]
     all_files: List[str]
     modules: List[str]
     module_files_map: Dict[str, List[str]]
@@ -288,25 +313,41 @@ class DocumenterState(TypedDict):
 
 def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     """
-    Node 1: Explore project directories and CMake configuration,
-    plan documentation layout, and initialize the output Markdown file.
-    If target_dirs is specified, only those folders are queued for documentation,
-    while other folders remain accessible for reference/exploration by tools.
+    Node 1: Explore project directories, CMake configuration, and entry points.
+    Plans documentation layout starting from the codebase entry point (main/bootstrap)
+    and traversing topologically, initializing the output Markdown file.
     """
+    import re
     proj_path = get_active_project_dir()
     out_file = Path(state["output_file"]).resolve()
 
-    console.print("\n[bold cyan]═══ Phase 1: Codebase Discovery & Documentation Planning ═══[/bold cyan]")
+    console.print("\n[bold cyan]═══ Phase 1: Codebase Discovery, Entry Point Detection & Documentation Planning ═══[/bold cyan]")
 
     init_documentation_file(out_file, proj_path.name)
 
-    # Exclude build and cache artifacts
+    # Exclude build, cache, and user-specified ignored directories
     ignored = {
-        "build", ".cache", ".git", ".vscode", ".idea"
+        "build", ".cache", ".git", ".vscode", ".idea",
+        "third_party", "thirdparty", "external", "vendor",
+        "deps", "_deps", "vcpkg_installed", "conan", "submodules"
     }
+    user_ignored = state.get("ignore_dirs")
+    if user_ignored:
+        for ign in user_ignored:
+            cleaned = ign.strip().lower().strip("/")
+            if cleaned:
+                ignored.add(cleaned)
 
     def is_ignored(p: Path) -> bool:
-        return any(part.lower() in ignored or part.startswith(".") for part in p.parts)
+        for part in p.parts:
+            part_lower = part.lower().strip()
+            if part_lower in ignored or part_lower.startswith("."):
+                return True
+        posix = "/" + p.as_posix().lower() + "/"
+        for ign in ignored:
+            if ign and (f"/{ign}/" in posix or posix.startswith(f"/{ign}/") or posix.endswith(f"/{ign}/")):
+                return True
+        return False
 
     headers = [p.relative_to(proj_path) for p in sorted(proj_path.glob("**/*.h*")) if not is_ignored(p)]
     sources = [p.relative_to(proj_path) for p in sorted(proj_path.glob("**/*.c*")) if not is_ignored(p)]
@@ -326,7 +367,29 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     for mod in sorted_modules:
         console.print(f"  📁 [bold]{escape(mod)}/[/bold] ({len(module_map[mod])} files)")
 
-    # Check for target_dirs filter
+    # 1. Detect Entry Point (where application starts execution)
+    entry_point_files: List[str] = []
+    for s in sources:
+        try:
+            full_p = proj_path / s
+            if full_p.exists():
+                txt = full_p.read_text(encoding="utf-8", errors="ignore")
+                if re.search(r'\bint\s+main\s*\(', txt) or re.search(r'\bvoid\s+main\s*\(', txt):
+                    entry_point_files.append(str(s))
+        except Exception:
+            pass
+
+    entry_point_module = None
+    if entry_point_files:
+        entry_point_module = str(Path(entry_point_files[0]).parent)
+        console.print(f"\n[bold cyan]🎯 Starting Point Detected:[/bold cyan] [green]{entry_point_files[0]}[/green] (Module: [yellow]{entry_point_module}/[/yellow])")
+    else:
+        for mod in sorted_modules:
+            if "include" in mod.lower() or mod == ".":
+                entry_point_module = mod
+                break
+
+    # 2. Check for target_dirs filter
     target_dirs = state.get("target_dirs")
     modules_to_document = sorted_modules
     if target_dirs:
@@ -338,12 +401,38 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
                 filtered.append(m)
         if filtered:
             modules_to_document = filtered
-            console.print(f"\n[bold green]Target Filter Applied:[/bold green] Queued {len(modules_to_document)} module(s) under [{', '.join(norm_targets)}] for documentation:")
+            console.print(f"\n[bold green]Target Scope Applied:[/bold green] Queued {len(modules_to_document)} module(s) under [{', '.join(norm_targets)}] for documentation:")
             for mod in modules_to_document:
                 console.print(f"  🎯 [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files)")
-            console.print("[dim]Note: Unselected/third-party folders can still be queried by clangd-query/rg for references if needed.[/dim]\n")
+            console.print("[dim]Note: Other folders can still be queried by clangd-query/rg for references if needed.[/dim]\n")
         else:
             console.print(f"[yellow]Warning: No modules matched target directories: {target_dirs}. Documenting all discovered modules.[/yellow]")
+
+    # 3. Order modules topologically starting from the entry point
+    def module_priority_sort(mod: str) -> int:
+        if entry_point_module and mod == entry_point_module:
+            return 0
+        if entry_point_files:
+            try:
+                txt = (proj_path / entry_point_files[0]).read_text(encoding="utf-8", errors="ignore")
+                for f in module_map.get(mod, []):
+                    fname = Path(f).name
+                    if f'"{fname}"' in txt or f'<{fname}>' in txt or fname in txt:
+                        return 1
+            except Exception:
+                pass
+        if "include" in mod.lower():
+            return 2
+        if "src" in mod.lower() or "source" in mod.lower():
+            return 3
+        return 4
+
+    modules_to_document = sorted(modules_to_document, key=lambda m: (module_priority_sort(m), m))
+
+    console.print(f"\n[bold green]Determined Documentation Order ({len(modules_to_document)} modules):[/bold green]")
+    for rank, mod in enumerate(modules_to_document, 1):
+        tag = " [bold magenta]★ Entry Point[/bold magenta]" if (entry_point_module and mod == entry_point_module) else ""
+        console.print(f"  {rank}. [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files){tag}")
 
     # Read CMakeLists.txt to build Section 1
     cmakelists = proj_path / "CMakeLists.txt"
@@ -355,14 +444,17 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Append Section 1: Architecture & Project Structure
+    # Append Section 1: Architecture & Project Structure (title has NO number; numbering is automatic)
     sec1_content = (
         f"### Overview\n"
-        f"This repository contains **{len(all_files)} C++ files** across **{len(sorted_modules)} directories**.\n"
+        f"This repository contains **{len(all_files)} C++ files** organized across **{len(sorted_modules)} directories**.\n"
     )
+    if entry_point_files:
+        sec1_content += f"> **Primary Application Entry Point**: `{entry_point_files[0]}` (Module `{entry_point_module}/`)\n\n"
+
     if target_dirs and len(modules_to_document) < len(sorted_modules):
         sec1_content += (
-            f"> **Documentation Scope**: Detailed documentation is generated specifically for: `{', '.join(target_dirs)}` "
+            f"> **Documentation Scope**: Detailed functional documentation is generated specifically for: `{', '.join(target_dirs)}` "
             f"({len(modules_to_document)} target modules). External and vendor folders are referenced where needed but omitted from dedicated chapters.\n\n"
         )
     else:
@@ -381,7 +473,7 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
         sec1_content += f"\n### Build System & Configuration (`CMakeLists.txt`)\n```cmake\n{cmake_text[:800]}\n```\n"
 
     append_documentation_section.invoke({
-        "section_title": "1. System Architecture & Build Configuration",
+        "section_title": "System Architecture & Build Configuration",
         "markdown_content": sec1_content,
         "level": 2
     })
@@ -416,7 +508,7 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
                 err_msg = str(e)
                 if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
                     import re
-                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
+                    match = re.search(r"retry in (\d+(?:\d+)?)s", err_msg, re.IGNORECASE)
                     wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
                     console.print(f"[yellow]Rate limit (429). Waiting {wait_time:.1f}s (attempt {attempt}/{max_retries})...[/yellow]")
                     time.sleep(wait_time)
@@ -435,7 +527,7 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
 
 def document_module_node_factory(llm, max_context_tokens: int = 32000, module_max_steps: int = 50):
     """
-    Create document_module node with 32k context limitation and step control.
+    Create document_module node with 32k context limitation, step control, and functional focus.
     """
     sub_agent = build_module_documenter_runner(llm, max_context_tokens=max_context_tokens)
 
@@ -445,19 +537,20 @@ def document_module_node_factory(llm, max_context_tokens: int = 32000, module_ma
         current_module = modules[idx]
         files = state["module_files_map"].get(current_module, [])
 
-        sec_num = idx + 2  # Section 1 is Architecture
         console.print(f"\n[bold yellow]═══ Phase 2: Documenting Module ({idx + 1}/{len(modules)}): [cyan]{escape(current_module)}/[/cyan] ({len(files)} files) ═══[/bold yellow]")
 
         prompt = (
-            f"You are writing publication-grade C++ documentation for module '{current_module}' "
-            f"as Section {sec_num} of the codebase documentation.\n"
+            f"You are writing in-depth functional C++ documentation for module '{current_module}'.\n"
             f"Files in this module:\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
-            f"INSTRUCTIONS:\n"
-            f"1. Use 'clangd_query' ('interface', 'show', 'hierarchy', 'signature') on the classes/structs/functions in this module.\n"
-            f"2. Use 'ripgrep_search' if needed to trace threading primitives (mutex, shared_mutex) and memory ownership (unique_ptr, shared_ptr).\n"
-            f"3. Call 'append_documentation_section' to write the documentation for this module directly to disk.\n"
-            f"   Include: Role & Purpose, Public API Reference, Member Variables, Concurrency/Thread-Safety Guarantees, Design Idioms, and Mermaid diagrams (strictly Mermaid only, never ASCII art) for class relationships or workflows.\n"
-            f"4. Once you have appended the section using 'append_documentation_section', conclude your module work."
+            f"TASK & FOCUS REQUIREMENTS:\n"
+            f"1. Investigate the symbols and implementations in these files using 'clangd_query' ('show', 'interface', 'signature') and 'read_project_file'.\n"
+            f"2. FOCUS ON FUNCTIONAL BEHAVIOR: Explain what this module actually does in practice, how its algorithms work, and what role it plays in the overall system.\n"
+            f"3. EXPLAIN CODE PARTS & LOGIC: Detail key methods, input parameters, transformations, concurrency locks (mutex/shared_mutex), return types, and error handling.\n"
+            f"4. Add a Mermaid sequence or flowchart diagram (strictly Mermaid only, never ASCII art) illustrating the runtime execution flow or class interactions.\n"
+            f"5. Call 'append_documentation_section' to save the section to disk.\n"
+            f"   IMPORTANT: For 'section_title', provide only a descriptive title (e.g. '{current_module.replace('/', ' ').title()} - Functional Architecture & Implementation'). "
+            f"   DO NOT include section numbers; numbering is managed automatically in sequence.\n"
+            f"6. Conclude once 'append_documentation_section' has been called."
         )
 
         sub_state: MessagesState = {
@@ -574,7 +667,8 @@ def run_codebase_documenter(
     ollama_host: str = "http://localhost:11434",
     max_context_tokens: int = 32000,
     module_max_steps: int = 50,
-    target_dirs: Optional[List[str]] = None
+    target_dirs: Optional[List[str]] = None,
+    ignore_dirs: Optional[List[str]] = None
 ) -> Path:
     """
     Execute the autonomous codebase documentation agent loop.
@@ -599,11 +693,13 @@ def run_codebase_documenter(
             model_name = "gemini-3.5-flash-lite"
 
     target_display = f"[cyan]{', '.join(target_dirs)}[/cyan]" if target_dirs else "[yellow]All repository modules[/yellow]"
+    ignore_display = f"[red]{', '.join(ignore_dirs)}[/red]" if ignore_dirs else "[dim]Standard build/vendor artifacts[/dim]"
 
     console.print(Panel(
         f"[bold cyan]Autonomous C++ Codebase Documentation Agent[/bold cyan]\n"
         f"Project Path    : [yellow]{proj_path}[/yellow]\n"
         f"Target Scope    : {target_display}\n"
+        f"Ignored Folders : {ignore_display}\n"
         f"Output Document : [green]{out_file}[/green]\n"
         f"Provider        : [green]{provider}[/green]\n"
         f"Model           : [green]{model_name}[/green]\n"
@@ -625,6 +721,7 @@ def run_codebase_documenter(
         "project_dir": str(proj_path),
         "output_file": str(out_file),
         "target_dirs": target_dirs,
+        "ignore_dirs": ignore_dirs,
         "all_files": [],
         "modules": [],
         "module_files_map": {},
@@ -653,6 +750,12 @@ def parse_args():
         default=None,
         help="Comma-separated list of folders/directories to generate documentation for (e.g. 'src,include' or 'src/engine'). "
              "Other folders (such as third_party or vendor) can still be explored and referenced by tools, but won't be documented."
+    )
+    parser.add_argument(
+        "--ignore-dirs",
+        type=str,
+        default=None,
+        help="Comma-separated list of folder/subfolder names to ignore completely during documentation (e.g. 'tests,benchmarks,legacy')."
     )
     parser.add_argument(
         "--output", "-o",
@@ -700,6 +803,10 @@ if __name__ == "__main__":
     if args.target_dirs:
         targets = [d.strip() for d in args.target_dirs.split(",") if d.strip()]
 
+    ignores = None
+    if args.ignore_dirs:
+        ignores = [d.strip() for d in args.ignore_dirs.split(",") if d.strip()]
+
     run_codebase_documenter(
         project_dir=args.project_dir,
         output_path=args.output,
@@ -708,5 +815,6 @@ if __name__ == "__main__":
         ollama_host=args.ollama_host,
         max_context_tokens=args.max_context_tokens,
         module_max_steps=args.max_steps,
-        target_dirs=targets
+        target_dirs=targets,
+        ignore_dirs=ignores
     )

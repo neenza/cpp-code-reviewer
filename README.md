@@ -98,11 +98,14 @@ cp .env.example .env
 
 ### 📖 Running the Autonomous Codebase Documenter (32k Context Limit)
 ```bash
-# Using Google Gemini (document all core modules):
+# Using Google Gemini (document all core modules starting from the entry point):
 python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
 
-# Documenting only specific target folders (ignoring third-party/vendor from documentation output):
-python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir /path/to/cpp_project --target-dirs "src,include"
+# Ignoring specific folders/subfolders (e.g. tests, benchmarks, legacy, vendor):
+python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir /path/to/cpp_project --ignore-dirs "tests,benchmarks,legacy"
+
+# Documenting only specific target folders (e.g. src and include):
+python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir /path/to/cpp_project --target-dirs "src,include" --ignore-dirs "tests"
 
 # Using Local/Offline Ollama with custom context limit:
 python code_documenter_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project --max-context-tokens 32000 --target-dirs "src/core,src/engine"
@@ -133,7 +136,8 @@ python code_review_agent.py --provider ollama --model llama3.1:8b --project-dir 
 | Argument | Description | Default |
 |---|---|---|
 | `--project-dir`, `-p` | Path to the target C++ codebase | `./sample_project` |
-| `--target-dirs`, `--include-dirs` | Comma-separated folders to generate documentation for (e.g. `src,include`). External/vendor code can still be accessed by tools for reference, but won't be documented. | All discovered modules |
+| `--target-dirs`, `--include-dirs` | Comma-separated folders to generate documentation for (e.g. `src,include`). External/vendor code can still be accessed by tools for reference, but won't be documented. | All repository modules |
+| `--ignore-dirs` | Comma-separated folders/subfolders to ignore completely from documentation (e.g. `tests,benchmarks,legacy`). | Built-in build/vendor exclusions |
 | `--output`, `-o` | Output Markdown file path | `<project-dir>/CODEBASE_DOCUMENTATION.md` or `CPP_CODE_REVIEW_REPORT.md` |
 | `--provider` | LLM backend: `gemini`, `google`, or `ollama` | `gemini` |
 | `--model`, `-m` | Model name (e.g., `gemini-3.5-flash-lite`, `llama3.1:8b`, `qwen2.5:14b`) | `gemini-3.5-flash-lite` |
