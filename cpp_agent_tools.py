@@ -248,19 +248,27 @@ def extract_text(content: Any) -> str:
         return str(content)
 
 
-def get_llm(provider: str, model_name: str, ollama_host: str = "http://localhost:11434"):
+def get_llm(
+    provider: str,
+    model_name: str,
+    ollama_host: str = "http://localhost:11434",
+    max_context_tokens: int = 32000
+):
     """
     Instantiate the appropriate LLM based on provider (Ollama or Gemini).
+    For Ollama, passes num_ctx=max_context_tokens (default: 32000) so Ollama allocates
+    a full 32k token context window instead of its default 2048 tokens.
     """
     provider = provider.lower()
     if provider == "ollama":
         try:
             from langchain_ollama import ChatOllama
-            console.print(f"[bold green]Initializing Ollama LLM:[/bold green] model='{model_name}', host='{ollama_host}'")
+            console.print(f"[bold green]Initializing Ollama LLM:[/bold green] model='{model_name}', host='{ollama_host}', num_ctx={max_context_tokens:,}")
             return ChatOllama(
                 model=model_name,
                 base_url=ollama_host,
                 temperature=0.1,
+                num_ctx=max_context_tokens,
             )
         except ImportError:
             raise ImportError("langchain-ollama is required. Run: pip install langchain-ollama")

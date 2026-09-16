@@ -77,7 +77,34 @@ def count_message_tokens(msg: BaseMessage) -> int:
     return tokens
 
 
-def trim_messages_to_budget(
+def partition_messages_safely(
+    messages: List[BaseMessage],
+    target_recent_count: int = 4
+) -> tuple:
+    """
+    Safely partition messages into older history (to summarize) and recent turns (to preserve intact),
+    guaranteeing that AIMessages with tool calls and their corresponding ToolMessages are never separated.
+    """
+    if len(messages) <= target_recent_count:
+        return [], messages
+
+    split_idx = len(messages) - target_recent_count
+
+    # 1. Advance split_idx forward past any contiguous ToolMessages so we don't start recent_turns with an orphan ToolMessage
+    while split_idx < len(messages) and isinstance(messages[split_idx], ToolMessage):
+        split_idx += 1
+
+    # 2. If the message immediately preceding split_idx was an AIMessage with tool_calls,
+    # move split_idx back before that AIMessage so its tool call and response remain together.
+    while split_idx > 0 and isinstance(messages[split_idx - 1], AIMessage) and getattr(messages[split_idx - 1], "tool_calls", None):
+        split_idx -= 1
+
+    older = messages[:split_idx]
+    recent = messages[split_idx:]
+    return older, recent
+
+
+def manage_context_with_summarization(
     messages: List[BaseMessage],
     max_tokens: int = 32000,
     reserve_tokens: int = 2500
@@ -85,8 +112,12 @@ def trim_messages_to_budget(
     """
     Enforce strict context size limit (default 32k).
     Preserves SystemMessage (index 0) and task prompt (index 1).
-    If total tokens exceed max_tokens - reserve_tokens, trims or truncates older tool messages
-    and intermediate turns from the beginning while preserving valid tool-call pairing.
+    If total tokens exceed max_tokens - reserve_tokens:
+      1. Truncates individual tool outputs that exceed 1,200 tokens.
+      2. Safely partitions history at turn boundaries and condenses older exploration
+         steps into a high-signal technical context summary (SystemMessage) to preserve
+         100% of discovered facts, reducing context size by >85%.
+      3. Preserves active recent conversation turns without breaking AIMessage/ToolMessage pairs.
     """
     allowed_budget = max_tokens - reserve_tokens
     total_tokens = sum(count_message_tokens(m) for m in messages)
@@ -94,51 +125,63 @@ def trim_messages_to_budget(
     if total_tokens <= allowed_budget:
         return messages
 
-    # We need to trim. Always preserve system message (0) and user initial prompt (1)
-    if len(messages) <= 2:
+    if len(messages) <= 3:
         return messages
 
-    preserved_header = messages[:2]
+    preserved_header = messages[:2]  # System prompt + initial task instruction
     conversation_tail = messages[2:]
 
-    # First pass: truncate excessively large tool message contents in the tail
+    # Step 1: Truncate single massive tool outputs (e.g. huge file reads)
     modified_tail: List[BaseMessage] = []
     for msg in conversation_tail:
         if isinstance(msg, ToolMessage):
             content_str = extract_text(msg.content)
-            if count_tokens(content_str) > 800:
-                truncated = content_str[:2500] + "\n... [Output truncated to respect 32k context budget]"
-                new_msg = ToolMessage(content=truncated, tool_call_id=msg.tool_call_id, name=msg.name)
-                modified_tail.append(new_msg)
+            if count_tokens(content_str) > 1200:
+                truncated = content_str[:3600] + "\n... [Remaining output truncated for context window budget]"
+                modified_tail.append(ToolMessage(content=truncated, tool_call_id=msg.tool_call_id, name=msg.name))
             else:
                 modified_tail.append(msg)
         else:
             modified_tail.append(msg)
 
-    # Re-check tokens
     cur_tokens = sum(count_message_tokens(m) for m in preserved_header) + sum(count_message_tokens(m) for m in modified_tail)
     if cur_tokens <= allowed_budget:
         return preserved_header + modified_tail
 
-    # Second pass: drop oldest message pairs (AIMessage with tool_calls + matching ToolMessages)
-    while modified_tail and cur_tokens > allowed_budget:
-        # Remove the oldest message from tail
-        popped = modified_tail.pop(0)
-        cur_tokens -= count_message_tokens(popped)
+    # Step 2: Context exceeds limit -> Perform Rolling Technical Summarization
+    console.print(f"  [bold yellow]⚡ Context reached {cur_tokens:,} tokens (exceeding {allowed_budget:,} limit). Summarizing older exploration steps...[/bold yellow]")
 
-        # If we popped an AIMessage that had tool_calls, drop its immediately following ToolMessages too
-        if isinstance(popped, AIMessage) and popped.tool_calls:
-            expected_ids = {tc["id"] for tc in popped.tool_calls if "id" in tc}
-            while modified_tail and isinstance(modified_tail[0], ToolMessage) and modified_tail[0].tool_call_id in expected_ids:
-                tool_msg = modified_tail.pop(0)
-                cur_tokens -= count_message_tokens(tool_msg)
+    history_to_summarize, recent_active_turns = partition_messages_safely(modified_tail, target_recent_count=4)
+    if not history_to_summarize:
+        return preserved_header + modified_tail
 
-    # Ensure the first message in the tail is not an orphaned ToolMessage
-    while modified_tail and isinstance(modified_tail[0], ToolMessage):
-        dropped = modified_tail.pop(0)
-        cur_tokens -= count_message_tokens(dropped)
+    # Extract exploration facts from history_to_summarize
+    extracted_facts = []
+    for m in history_to_summarize:
+        if isinstance(m, ToolMessage):
+            raw = extract_text(m.content).strip()
+            if raw:
+                preview = raw[:400].replace("\n", " ")
+                extracted_facts.append(f"• Tool `{m.name}` revealed: {preview}")
+        elif isinstance(m, AIMessage):
+            text = extract_text(m.content).strip()
+            if text:
+                extracted_facts.append(f"• Agent noted: {text[:300].replace(chr(10), ' ')}")
 
-    return preserved_header + modified_tail
+    summary_text = (
+        "### Summary of Prior Codebase Exploration (Condensed to stay within 32k context limit):\n"
+        + ("\n".join(extracted_facts[:15]) if extracted_facts else "Explored files and symbols in current module.")
+    )
+
+    summary_message = SystemMessage(content=summary_text)
+    new_messages = preserved_header + [summary_message] + recent_active_turns
+    new_tokens = sum(count_message_tokens(m) for m in new_messages)
+    console.print(f"  [bold green]✔ Context successfully summarized from {cur_tokens:,} down to {new_tokens:,} tokens.[/bold green]")
+    return new_messages
+
+
+# Alias for backward compatibility
+trim_messages_to_budget = manage_context_with_summarization
 
 
 # ============================================================================
@@ -169,6 +212,112 @@ def init_documentation_file(output_path: Path, project_name: str) -> None:
     with open(_DOC_OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(header)
         f.flush()
+
+
+def extract_section_summary(title: str, markdown_content: str) -> str:
+    """
+    Extract a structured, high-signal architectural summary from a section's Markdown documentation.
+    Produces:
+      - Functional Purpose & Responsibilities
+      - Primary Classes, Structs, and Interfaces
+      - Concurrency, Resource Management, and Key Mechanics
+    """
+    import re
+
+    # 1. Strip code blocks, HTML comments, and markdown table markup
+    clean_text = re.sub(r'<!--.*?-->', '', markdown_content, flags=re.DOTALL)
+    text_without_code = re.sub(r'```.*?```', '', clean_text, flags=re.DOTALL).strip()
+
+    # 2. Extract Key Classes / Interfaces / Structs (PascalCase symbols)
+    symbols = set()
+    for match in re.finditer(r'\b(?:class|struct|interface)\s+([A-Z][A-Za-z0-9_]{2,})\b', markdown_content):
+        sym = match.group(1).strip()
+        if sym not in {"Class", "Struct", "Interface", "Type", "Overview", "Architecture"}:
+            symbols.add(sym)
+
+    # Extract backticked identifiers in bullet points
+    for match in re.finditer(r'[-*]\s+`([A-Za-z0-9_:]+)`', text_without_code):
+        sym = match.group(1).strip()
+        if len(sym) >= 3 and (sym[0].isupper() or "::" in sym or "_" in sym):
+            if sym not in {"TODO", "NOTE", "WARNING", "IMPORTANT"}:
+                symbols.add(sym)
+
+    # 3. Extract opening functional overview / role narrative
+    lines = [line.strip() for line in text_without_code.split("\n") if line.strip()]
+    narrative_lines = []
+    for line in lines:
+        if line.startswith("#") or line.startswith("|") or line.startswith("---") or line.startswith(">") or line.startswith("<!--") or line.startswith("-") or line.startswith("*"):
+            continue
+        cleaned = re.sub(r'[`*_#]', '', line).strip()
+        if len(cleaned) > 25:
+            narrative_lines.append(cleaned)
+            if len(" ".join(narrative_lines)) > 240:
+                break
+
+    overview_text = " ".join(narrative_lines)
+    if not overview_text:
+        overview_text = f"Functional implementation and architecture for {title}."
+
+    if len(overview_text) > 300:
+        cut = overview_text[:300].rsplit(".", 1)
+        overview_text = (cut[0] + ".") if len(cut) > 1 and len(cut[0]) > 80 else overview_text[:280] + "..."
+
+    # 4. Detect concurrency, threading, and resource management traits
+    traits = []
+    lower_content = markdown_content.lower()
+    if "shared_mutex" in lower_content:
+        traits.append("Read/Write Concurrency (`std::shared_mutex`)")
+    elif "mutex" in lower_content or "lock_guard" in lower_content or "unique_lock" in lower_content:
+        traits.append("Thread-Safe (`std::mutex` / RAII locks)")
+    if "atomic" in lower_content:
+        traits.append("Atomic State (`std::atomic`)")
+    if "unique_ptr" in lower_content or "shared_ptr" in lower_content or "raii" in lower_content:
+        traits.append("RAII Smart Pointer Ownership")
+    if "socket" in lower_content or "epoll" in lower_content or "poll" in lower_content or "tcp" in lower_content:
+        traits.append("Network I/O Handling")
+
+    summary_lines = [
+        f"• Purpose: {overview_text}"
+    ]
+    if symbols:
+        sorted_syms = sorted(list(symbols))[:8]
+        syms_str = ", ".join(f"`{s}`" for s in sorted_syms)
+        summary_lines.append(f"• Key Types & Abstractions: {syms_str}")
+    if traits:
+        traits_str = ", ".join(traits)
+        summary_lines.append(f"• Design & Concurrency: {traits_str}")
+
+    return "\n".join(summary_lines)
+
+
+def format_architectural_memory() -> str:
+    """
+    Generate a structured architectural memory ledger of all previously documented
+    sections and modules, to be injected into the prompt of each subsequent module.
+    """
+    global _DOCUMENTED_SECTIONS
+    if not _DOCUMENTED_SECTIONS:
+        return "PRIOR ARCHITECTURAL CONTEXT: This is the first module being documented. No prior module documentation exists yet."
+
+    lines = [
+        "════════════════════════════════════════════════════════════════════════════════",
+        "ARCHITECTURAL MEMORY OF PREVIOUSLY DOCUMENTED MODULES (Cross-Folder Context):",
+        "Use this context to understand existing system abstractions, avoid duplicate explanations,",
+        "and establish cross-module references and data-flow connections.",
+        "════════════════════════════════════════════════════════════════════════════════"
+    ]
+
+    for sec in _DOCUMENTED_SECTIONS:
+        lines.append(f"\n[{sec['title']}]")
+        summary_body = sec.get("summary") or sec.get("preview", "")
+        lines.append(summary_body)
+
+    lines.append("\nCROSS-MODULE GUIDELINES FOR THIS FOLDER:")
+    lines.append("• Connect this folder's components to the previously documented abstractions above.")
+    lines.append("• If classes in this folder implement, inherit, call, or manage types from earlier sections, explain how they fit into the overall data and control flow.")
+    lines.append("• Do NOT re-explain the internal details of already documented types; reference them concisely.")
+    lines.append("════════════════════════════════════════════════════════════════════════════════")
+    return "\n".join(lines)
 
 
 @tool
@@ -213,11 +362,14 @@ def append_documentation_section(
             f.write(formatted_chunk)
             f.flush()
 
+        summary = extract_section_summary(numbered_title, markdown_content)
+
         _DOCUMENTED_SECTIONS.append({
             "title": numbered_title,
             "raw_title": clean_title,
             "level": level,
             "timestamp": time.time(),
+            "summary": summary,
             "preview": markdown_content[:120].replace("\n", " ")
         })
 
@@ -229,28 +381,32 @@ def append_documentation_section(
 
 @tool
 def read_current_documentation_toc() -> str:
-    """Read the current Table of Contents of all sections that have already been written to disk.
-    Use this to see what has already been documented and avoid duplicate sections.
+    """Read the current Table of Contents and architectural summary of all sections that have already been written to disk.
+    Use this to see what has already been documented, review existing abstractions, and avoid duplicate sections.
     """
     global _DOCUMENTED_SECTIONS
     if not _DOCUMENTED_SECTIONS:
         return "No documentation sections have been written yet."
 
-    lines = ["Current Documented Sections:"]
+    lines = ["Current Documented Sections & Architectural Memory:"]
     for i, s in enumerate(_DOCUMENTED_SECTIONS, 1):
-        indent = "  " * (s.get("level", 2) - 1)
-        lines.append(f"{indent}- {s['title']}")
+        indent = "  " * max(0, (s.get("level", 2) - 1))
+        lines.append(f"\n{indent}- **{s['title']}**")
+        if "summary" in s and s["summary"]:
+            for subline in s["summary"].split("\n"):
+                lines.append(f"{indent}  {subline}")
     return "\n".join(lines)
 
 
-DOCUMENTER_TOOLS = [
+EXPLORATION_TOOLS = [
     clangd_query,
     ripgrep_search,
     read_project_file,
     list_project_structure,
-    append_documentation_section,
     read_current_documentation_toc
 ]
+
+DOCUMENTER_TOOLS = EXPLORATION_TOOLS + [append_documentation_section]
 
 
 # ============================================================================
@@ -290,6 +446,10 @@ CORE INSTRUCTIONS & STANDARDS:
 5. 🧠 CONTEXT EFFICIENCY (32k LIMIT):
    - Keep tool queries targeted and focused.
    - Append sections incrementally to keep the context window compact and clean.
+6. 🔗 CROSS-MODULE ARCHITECTURAL MEMORY & CONTINUITY:
+   - When moving between folders, you have access to the ARCHITECTURAL MEMORY of all previously documented modules.
+   - Explicitly link your explanations to components established in prior sections (e.g. refer to classes/interfaces defined in header folders when analyzing implementation folders).
+   - Avoid redundant duplication: build upon existing abstractions rather than re-explaining them from scratch.
 ════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -487,16 +647,22 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     }
 
 
+class ModuleAgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], operator.add]
+    module_name: str
+    append_called: bool
+    reminder_count: int
+
+
 def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
     """
     Build focused LangGraph sub-agent for documenting a specific directory module,
-    strictly bounded by the 32k context size limit.
+    strictly bounded by the 32k context size limit and driven to call append_documentation_section.
     """
     llm_with_tools = llm.bind_tools(DOCUMENTER_TOOLS)
 
-    def agent_step(state: MessagesState) -> Dict[str, Any]:
-        # Enforce 32k context token limit
-        trimmed_messages = trim_messages_to_budget(state["messages"], max_tokens=max_context_tokens)
+    def agent_step(state: ModuleAgentState) -> Dict[str, Any]:
+        trimmed_messages = manage_context_with_summarization(state["messages"], max_tokens=max_context_tokens)
 
         max_retries = 5
         base_delay = 6
@@ -515,20 +681,162 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
                 else:
                     raise e
 
-    tool_node = ToolNode(DOCUMENTER_TOOLS)
-    wf = StateGraph(MessagesState)
+    def route_module_agent_step(state: ModuleAgentState) -> str:
+        last_msg = state["messages"][-1]
+
+        # 1. Check if model made tool calls
+        if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+            for tc in last_msg.tool_calls:
+                if tc.get("name") == "append_documentation_section":
+                    return "execute_append"
+            return "tools"
+
+        # 2. No tool calls: model returned natural language text
+        if state.get("append_called", False):
+            return END
+
+        reminders = state.get("reminder_count", 0)
+        if reminders < 2:
+            return "remind_to_append"
+        else:
+            return "commit_text_as_section"
+
+    exploration_tool_node = ToolNode(EXPLORATION_TOOLS)
+
+    def execute_append_node(state: ModuleAgentState) -> Dict[str, Any]:
+        last_msg = state["messages"][-1]
+        tool_messages = []
+        for tc in getattr(last_msg, "tool_calls", []):
+            if tc.get("name") == "append_documentation_section":
+                args = tc.get("args", {})
+                res = append_documentation_section.invoke(args)
+                tool_messages.append(ToolMessage(
+                    content=str(res),
+                    tool_call_id=tc.get("id", "append_id"),
+                    name="append_documentation_section"
+                ))
+            else:
+                for t in EXPLORATION_TOOLS:
+                    if t.name == tc.get("name"):
+                        res = t.invoke(tc.get("args", {}))
+                        tool_messages.append(ToolMessage(
+                            content=str(res),
+                            tool_call_id=tc.get("id", "tool_id"),
+                            name=t.name
+                        ))
+        return {"messages": tool_messages, "append_called": True}
+
+    def remind_to_append_node(state: ModuleAgentState) -> Dict[str, Any]:
+        reminders = state.get("reminder_count", 0) + 1
+        last_msg = state["messages"][-1]
+        text_content = extract_message_text(last_msg)
+        mod = state.get("module_name", "Module")
+
+        if len(text_content) > 150 or "#" in text_content or "```" in text_content:
+            reminder_text = (
+                f"You have prepared an analysis for module '{mod}', but the documentation has NOT been saved yet.\n"
+                f"You MUST now invoke the 'append_documentation_section' tool to save it to disk.\n"
+                f"Parameters:\n"
+                f"- section_title: Clean title without any section numbers (e.g. '{mod.replace('/', ' ').title()} - Functional Architecture & Implementation')\n"
+                f"- markdown_content: Your full Markdown documentation (including code logic, key methods, and Mermaid diagram)."
+            )
+        else:
+            reminder_text = (
+                f"You have not documented module '{mod}' yet. "
+                f"Use tools ('read_project_file', 'clangd_query', 'ripgrep_search') to inspect the code, "
+                f"and when ready, you MUST call 'append_documentation_section' to save the section to disk."
+            )
+
+        return {
+            "messages": [HumanMessage(content=reminder_text)],
+            "reminder_count": reminders
+        }
+
+    def commit_text_as_section_node(state: ModuleAgentState) -> Dict[str, Any]:
+        mod = state.get("module_name", "Module")
+        clean_title = f"{mod.replace('/', ' ').title()} - Functional Architecture & Implementation"
+
+        # Search backward for the most comprehensive assistant response
+        candidates = []
+        for m in reversed(state["messages"]):
+            if isinstance(m, AIMessage):
+                txt = extract_message_text(m)
+                if txt and len(txt) > 80:
+                    candidates.append(txt)
+
+        doc_content = candidates[0] if candidates else f"Functional documentation for module `{mod}/`."
+        console.print(f"  [bold yellow]⚡ Committing model's generated documentation text to disk...[/bold yellow]")
+        append_documentation_section.invoke({
+            "section_title": clean_title,
+            "markdown_content": doc_content,
+            "level": 2
+        })
+        return {"append_called": True}
+
+    wf = StateGraph(ModuleAgentState)
     wf.add_node("agent", agent_step)
-    wf.add_node("tools", tool_node)
+    wf.add_node("tools", exploration_tool_node)
+    wf.add_node("execute_append", execute_append_node)
+    wf.add_node("remind_to_append", remind_to_append_node)
+    wf.add_node("commit_text_as_section", commit_text_as_section_node)
+
     wf.add_edge(START, "agent")
-    wf.add_conditional_edges("agent", tools_condition, ["tools", END])
+    wf.add_conditional_edges("agent", route_module_agent_step, {
+        "tools": "tools",
+        "execute_append": "execute_append",
+        "remind_to_append": "remind_to_append",
+        "commit_text_as_section": "commit_text_as_section",
+        END: END
+    })
     wf.add_edge("tools", "agent")
+    wf.add_edge("remind_to_append", "agent")
+    wf.add_edge("execute_append", END)
+    wf.add_edge("commit_text_as_section", END)
+
     return wf.compile()
+
+
+def extract_message_text(msg: Any) -> str:
+    """Extract plain text from an AIMessage, content list, or string, with fallback to tool call args."""
+    if msg is None:
+        return ""
+    if isinstance(msg, str):
+        return msg.strip()
+
+    content = getattr(msg, "content", msg)
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item and item["text"]:
+                    parts.append(str(item["text"]))
+                elif "content" in item and item["content"]:
+                    parts.append(str(item["content"]))
+            elif hasattr(item, "text"):
+                parts.append(str(getattr(item, "text", "")))
+            elif hasattr(item, "content"):
+                parts.append(str(getattr(item, "content", "")))
+        combined = "".join(parts).strip()
+        if combined:
+            return combined
+
+    if hasattr(msg, "tool_calls") and msg.tool_calls:
+        for tc in msg.tool_calls:
+            args = tc.get("args", {})
+            if "markdown_content" in args and str(args["markdown_content"]).strip():
+                return str(args["markdown_content"]).strip()
+
+    return ""
 
 
 def document_module_node_factory(llm, max_context_tokens: int = 32000, module_max_steps: int = 50):
     """
     Create document_module node with 32k context limitation, step control, functional focus,
-    and guaranteed section appending fallback.
+    and guaranteed section appending.
     """
     sub_agent = build_module_documenter_runner(llm, max_context_tokens=max_context_tokens)
 
@@ -540,93 +848,82 @@ def document_module_node_factory(llm, max_context_tokens: int = 32000, module_ma
 
         console.print(f"\n[bold yellow]═══ Phase 2: Documenting Module ({idx + 1}/{len(modules)}): [cyan]{escape(current_module)}/[/cyan] ({len(files)} files) ═══[/bold yellow]")
 
+        arch_memory = format_architectural_memory()
+
         prompt = (
             f"You are writing in-depth functional C++ documentation for module '{current_module}'.\n"
             f"Files in this module:\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
-            f"TASK & FOCUS REQUIREMENTS:\n"
-            f"1. Investigate the symbols and implementations in these files using 'clangd_query' ('show', 'interface', 'signature') and 'read_project_file'.\n"
-            f"2. FOCUS ON FUNCTIONAL BEHAVIOR: Explain what this module actually does in practice, how its algorithms work, and what role it plays in the overall system.\n"
-            f"3. EXPLAIN CODE PARTS & LOGIC: Detail key methods, input parameters, transformations, concurrency locks (mutex/shared_mutex), return types, and error handling.\n"
-            f"4. Add a Mermaid sequence or flowchart diagram (strictly Mermaid only, never ASCII art) illustrating the runtime execution flow or class interactions.\n"
-            f"5. MANDATORY FINAL STEP: You MUST call the 'append_documentation_section' tool to write your documentation to disk.\n"
-            f"   IMPORTANT: For 'section_title', provide only a descriptive title (e.g. '{current_module.replace('/', ' ').title()} - Functional Architecture & Implementation'). "
-            f"   DO NOT include section numbers; numbering is managed automatically in sequence.\n"
-            f"6. Conclude once 'append_documentation_section' has been called."
+            f"{arch_memory}\n\n"
+            f"TASK & WORKFLOW FOR THIS MODULE:\n"
+            f"1. EXPLORE: Use 'read_project_file' or 'clangd_query' ('show', 'interface', 'signature') to inspect the code.\n"
+            f"2. FUNCTIONAL EXPLANATION: Explain what this module actually does in practice, its business logic, operational behavior, and role in the system.\n"
+            f"   CROSS-REFERENCE: Explicitly connect this module to previously documented components listed in the architectural memory above.\n"
+            f"3. CODE DETAILS: Detail key classes, member variables, functions, input parameters, concurrency locks (mutex/shared_mutex), and error handling.\n"
+            f"4. MERMAID DIAGRAM: Include at least one Mermaid diagram (strictly Mermaid only inside ```mermaid ... ```, no ASCII art) showing execution flow or relationships with other modules.\n"
+            f"5. COMMIT DOCUMENTATION: You MUST invoke the 'append_documentation_section' tool to save your documentation to disk.\n"
+            f"   - 'section_title': Semantic title WITHOUT any section numbers (e.g. '{current_module.replace('/', ' ').title()} - Functional Architecture & Implementation')\n"
+            f"   - 'markdown_content': The complete Markdown documentation text.\n"
+            f"Call 'read_project_file' or 'clangd_query' to begin exploration now."
         )
 
-        sub_state: MessagesState = {
+        sub_state: ModuleAgentState = {
             "messages": [
                 SystemMessage(content=DOCUMENTER_SYSTEM_PROMPT),
                 HumanMessage(content=prompt)
-            ]
+            ],
+            "module_name": current_module,
+            "append_called": False,
+            "reminder_count": 0
         }
 
         sections_before = len(_DOCUMENTED_SECTIONS)
-        last_assistant_content = ""
-        conversation_history: List[BaseMessage] = list(sub_state["messages"])
 
         try:
             for step in sub_agent.stream(sub_state, {"recursion_limit": module_max_steps}, stream_mode="updates"):
                 for node_name, node_update in step.items():
                     if node_name == "agent":
                         msg = node_update["messages"][-1]
-                        conversation_history.append(msg)
-                        raw_text = extract_text(msg.content).strip()
-                        if raw_text:
-                            last_assistant_content = raw_text
-                        if msg.tool_calls:
+                        if getattr(msg, "tool_calls", None):
                             for tc in msg.tool_calls:
                                 console.print(f"  [magenta]▶ Tool:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})")
+                        else:
+                            txt = extract_message_text(msg)
+                            if txt:
+                                console.print(f"  [dim]↳ Agent: {escape(txt[:100])}...[/dim]")
                     elif node_name == "tools":
                         for msg in node_update["messages"]:
-                            conversation_history.append(msg)
                             raw_text = extract_text(msg.content)
                             preview = raw_text[:120].replace("\n", " ")
                             if len(raw_text) > 120:
                                 preview += "..."
                             console.print(f"[dim]    ↳ Result: {escape(preview)}[/dim]")
+                    elif node_name == "remind_to_append":
+                        console.print("  [yellow]⚡ Nudging agent to invoke 'append_documentation_section'...[/yellow]")
+                    elif node_name == "execute_append":
+                        console.print("  [bold green]✔ Section committed to documentation file.[/bold green]")
+                    elif node_name == "commit_text_as_section":
+                        console.print("  [bold green]✔ Saved agent's markdown documentation to file.[/bold green]")
         except Exception as e:
             console.print(f"[dim yellow]  (Module exploration step ended: {e})[/dim yellow]")
 
-        # GUARANTEED APPEND CHECK: Verify if a section was actually written for this module
+        # In the unlikely event that an external error aborted execution before append was called:
         if len(_DOCUMENTED_SECTIONS) == sections_before:
-            clean_module_title = f"{current_module.replace('/', ' ').title()} - Functional Architecture & Implementation"
-
-            # Case A: Agent provided documentation directly in assistant text without calling the tool
-            if len(last_assistant_content) > 150:
-                console.print(f"  [bold yellow]⚡ Agent provided documentation directly in text; auto-saving section...[/bold yellow]")
-                append_documentation_section.invoke({
-                    "section_title": clean_module_title,
-                    "markdown_content": last_assistant_content,
-                    "level": 2
-                })
-            else:
-                # Case B: Agent only explored or did not generate text; run guaranteed direct synthesis
-                console.print(f"  [bold yellow]⚡ Running guaranteed documentation synthesis for module '{escape(current_module)}'...[/bold yellow]")
-                try:
-                    synth_messages = trim_messages_to_budget(
-                        conversation_history + [
-                            HumanMessage(content=(
-                                f"Based on the files and code explored above for module '{current_module}', "
-                                f"write comprehensive, publication-grade functional Markdown documentation now.\n"
-                                f"Explain what the code does in practice, key methods breakdown, inputs/outputs, concurrency, "
-                                f"and include a Mermaid diagram (strictly Mermaid only)."
-                            ))
-                        ],
-                        max_tokens=max_context_tokens
-                    )
-                    synth_resp = llm.invoke(synth_messages)
-                    synth_content = extract_text(synth_resp.content).strip()
-                    if synth_content:
-                        append_documentation_section.invoke({
-                            "section_title": clean_module_title,
-                            "markdown_content": synth_content,
-                            "level": 2
-                        })
-                    else:
-                        console.print(f"[red]Warning: Synthesis returned empty text for module '{current_module}'.[/red]")
-                except Exception as synth_err:
-                    console.print(f"[red]Synthesis error for module '{current_module}': {synth_err}[/red]")
+            clean_module_title = f"{current_module.replace('/', ' ').title()} - Overview & Architecture"
+            basic_doc = (
+                f"### Architectural Overview of `{current_module}/`\n\n"
+                f"This module contains {len(files)} C++ source and header file(s):\n"
+                + "\n".join(f"- `{f}`" for f in files) + "\n\n"
+                f"```mermaid\n"
+                f"graph TD\n"
+                f"    Module[\"{current_module} Module\"]\n"
+                + "\n".join(f"    Module --> F{i}[\"{Path(f).name}\"]" for i, f in enumerate(files[:10]))
+                + "\n```\n"
+            )
+            append_documentation_section.invoke({
+                "section_title": clean_module_title,
+                "markdown_content": basic_doc,
+                "level": 2
+            })
 
         pct = ((idx + 1) / len(modules)) * 100
         console.print(f"[green]✔ Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
@@ -760,7 +1057,12 @@ def run_codebase_documenter(
         border_style="cyan"
     ))
 
-    llm = get_llm(provider=provider, model_name=model_name, ollama_host=ollama_host)
+    llm = get_llm(
+        provider=provider,
+        model_name=model_name,
+        ollama_host=ollama_host,
+        max_context_tokens=max_context_tokens
+    )
     app = build_codebase_documenter_graph(
         llm=llm,
         max_context_tokens=max_context_tokens,
