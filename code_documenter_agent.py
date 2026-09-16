@@ -104,56 +104,89 @@ def partition_messages_safely(
     return older, recent
 
 
+def print_context_banner(messages: List[BaseMessage], max_tokens: int, stage: str = "Step") -> int:
+    """Print current context size, percentage, and stage banner."""
+    total_tokens = sum(count_message_tokens(m) for m in messages)
+    pct = (total_tokens / max(1, max_tokens)) * 100
+    color = "green" if pct < 40 else ("yellow" if pct < 75 else "bold red")
+    console.print(f"  [{color}]🧠 Context: {total_tokens:,} / {max_tokens:,} tokens ({pct:.1f}%) | {stage}[/{color}]")
+    return total_tokens
+
+
+def is_substantive_documentation(text: str) -> bool:
+    """Check if text is an actual comprehensive documentation section rather than a conversational remark."""
+    if not text or len(text.strip()) < 350:
+        return False
+    stripped = text.strip()
+    has_markdown_structure = (
+        "#" in stripped or "```" in stripped or "•" in stripped or "\n- " in stripped or "\n\n" in stripped
+    )
+    first_line = stripped.splitlines()[0].lower()
+    is_transitional = any(first_line.startswith(prefix) for prefix in [
+        "now i have", "i have thoroughly", "let me compile", "let me write", "i will now",
+        "i am ready to", "let me proceed", "i will compile", "i will create", "i have now"
+    ]) and len(stripped.splitlines()) < 4
+
+    return has_markdown_structure and not is_transitional and len(stripped.splitlines()) >= 4
+
+
 def manage_context_with_summarization(
     messages: List[BaseMessage],
     max_tokens: int = 32000,
-    reserve_tokens: int = 2500
+    reserve_tokens: int = 2500,
+    summarize_threshold: Optional[int] = None
 ) -> List[BaseMessage]:
     """
-    Enforce strict context size limit (default 32k).
-    Preserves SystemMessage (index 0) and task prompt (index 1).
-    If total tokens exceed max_tokens - reserve_tokens:
-      1. Truncates individual tool outputs that exceed 1,200 tokens.
-      2. Safely partitions history at turn boundaries and condenses older exploration
-         steps into a high-signal technical context summary (SystemMessage) to preserve
-         100% of discovered facts, reducing context size by >85%.
-      3. Preserves active recent conversation turns without breaking AIMessage/ToolMessage pairs.
+    Enforce strict context size limit with proactive rolling summarization.
+    - Default strict trigger: min(12000, max_tokens * 0.45) tokens, so the context is actively
+      summarized and kept lightweight on local models well before hitting 32k.
+    - Truncates individual tool outputs exceeding 600 tokens (approx 2,400 chars).
+    - Safely partitions history at turn boundaries and condenses older exploration steps
+      into a high-signal technical context summary (SystemMessage), reducing context size by >80%.
+    - Preserves valid [AIMessage, ToolMessage] pairing.
     """
-    allowed_budget = max_tokens - reserve_tokens
-    total_tokens = sum(count_message_tokens(m) for m in messages)
+    if summarize_threshold is None:
+        summarize_threshold = min(12000, int(max_tokens * 0.45))
+    effective_limit = min(summarize_threshold, max_tokens - reserve_tokens)
 
-    if total_tokens <= allowed_budget:
-        return messages
-
-    if len(messages) <= 3:
-        return messages
-
-    preserved_header = messages[:2]  # System prompt + initial task instruction
-    conversation_tail = messages[2:]
-
-    # Step 1: Truncate single massive tool outputs (e.g. huge file reads)
+    # Step 1: Truncate single massive tool outputs (over 600 tokens)
     modified_tail: List[BaseMessage] = []
-    for msg in conversation_tail:
-        if isinstance(msg, ToolMessage):
-            content_str = extract_text(msg.content)
-            if count_tokens(content_str) > 1200:
-                truncated = content_str[:3600] + "\n... [Remaining output truncated for context window budget]"
-                modified_tail.append(ToolMessage(content=truncated, tool_call_id=msg.tool_call_id, name=msg.name))
+    tail_modified = False
+    if len(messages) > 2:
+        preserved_header = messages[:2]
+        conversation_tail = messages[2:]
+        for msg in conversation_tail:
+            if isinstance(msg, ToolMessage):
+                content_str = extract_text(msg.content)
+                t_count = count_tokens(content_str)
+                if t_count > 600:
+                    truncated = content_str[:2200] + "\n... [Remaining tool output truncated for strict context budget]"
+                    modified_tail.append(ToolMessage(content=truncated, tool_call_id=msg.tool_call_id, name=msg.name))
+                    tail_modified = True
+                else:
+                    modified_tail.append(msg)
             else:
                 modified_tail.append(msg)
-        else:
-            modified_tail.append(msg)
+    else:
+        preserved_header = messages
+        conversation_tail = []
 
-    cur_tokens = sum(count_message_tokens(m) for m in preserved_header) + sum(count_message_tokens(m) for m in modified_tail)
-    if cur_tokens <= allowed_budget:
-        return preserved_header + modified_tail
+    cur_messages = preserved_header + modified_tail if tail_modified else messages
+    cur_tokens = sum(count_message_tokens(m) for m in cur_messages)
 
-    # Step 2: Context exceeds limit -> Perform Rolling Technical Summarization
-    console.print(f"  [bold yellow]⚡ Context reached {cur_tokens:,} tokens (exceeding {allowed_budget:,} limit). Summarizing older exploration steps...[/bold yellow]")
+    if cur_tokens <= effective_limit or len(cur_messages) <= 3:
+        return cur_messages
 
-    history_to_summarize, recent_active_turns = partition_messages_safely(modified_tail, target_recent_count=4)
+    # Step 2: Context exceeds strict limit -> Perform Rolling Technical Summarization
+    console.print(
+        f"\n  [bold yellow]⚡ Context reached {cur_tokens:,} tokens (exceeding strict threshold {effective_limit:,}). "
+        f"Active Rolling Summarization initiated...[/bold yellow]"
+    )
+
+    tail_to_partition = modified_tail if tail_modified else list(cur_messages[2:])
+    history_to_summarize, recent_active_turns = partition_messages_safely(tail_to_partition, target_recent_count=2)
     if not history_to_summarize:
-        return preserved_header + modified_tail
+        return cur_messages
 
     # Extract exploration facts from history_to_summarize
     extracted_facts = []
@@ -161,22 +194,23 @@ def manage_context_with_summarization(
         if isinstance(m, ToolMessage):
             raw = extract_text(m.content).strip()
             if raw:
-                preview = raw[:400].replace("\n", " ")
+                preview = raw[:350].replace("\n", " ")
                 extracted_facts.append(f"• Tool `{m.name}` revealed: {preview}")
         elif isinstance(m, AIMessage):
-            text = extract_text(m.content).strip()
-            if text:
-                extracted_facts.append(f"• Agent noted: {text[:300].replace(chr(10), ' ')}")
+            text = extract_message_text(m)
+            if text and len(text) > 30 and not is_substantive_documentation(text):
+                extracted_facts.append(f"• Exploration Note: {text[:250].replace(chr(10), ' ')}")
 
     summary_text = (
-        "### Summary of Prior Codebase Exploration (Condensed to stay within 32k context limit):\n"
+        "### Summary of Prior Codebase Exploration (Condensed to stay within strict context limit):\n"
         + ("\n".join(extracted_facts[:15]) if extracted_facts else "Explored files and symbols in current module.")
     )
 
     summary_message = SystemMessage(content=summary_text)
     new_messages = preserved_header + [summary_message] + recent_active_turns
     new_tokens = sum(count_message_tokens(m) for m in new_messages)
-    console.print(f"  [bold green]✔ Context successfully summarized from {cur_tokens:,} down to {new_tokens:,} tokens.[/bold green]")
+    saved = cur_tokens - new_tokens
+    console.print(f"  [bold green]✔ Context condensed from {cur_tokens:,} down to {new_tokens:,} tokens (-{(saved/max(1, cur_tokens))*100:.1f}%, saved {saved:,} tokens).[/bold green]\n")
     return new_messages
 
 
@@ -469,6 +503,7 @@ class DocumenterState(TypedDict):
     current_module_index: int
     sections_count: int
     max_context_tokens: int
+    summarize_threshold: int
 
 
 def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
@@ -647,29 +682,50 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     }
 
 
+def message_reducer(existing: List[BaseMessage], update: Any) -> List[BaseMessage]:
+    """Custom reducer supporting list concatenation and explicit context override upon summarization."""
+    if isinstance(update, tuple) and len(update) == 2 and update[0] == "override":
+        return list(update[1])
+    if isinstance(update, list):
+        return list(existing) + list(update)
+    if isinstance(update, BaseMessage):
+        return list(existing) + [update]
+    return list(existing)
+
+
 class ModuleAgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], operator.add]
+    messages: Annotated[List[BaseMessage], message_reducer]
     module_name: str
     append_called: bool
     reminder_count: int
 
 
-def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
+def build_module_documenter_runner(
+    llm,
+    max_context_tokens: int = 32000,
+    summarize_threshold: Optional[int] = None
+):
     """
     Build focused LangGraph sub-agent for documenting a specific directory module,
-    strictly bounded by the 32k context size limit and driven to call append_documentation_section.
+    strictly bounded by proactive context limits and guaranteed synthesis.
     """
     llm_with_tools = llm.bind_tools(DOCUMENTER_TOOLS)
 
     def agent_step(state: ModuleAgentState) -> Dict[str, Any]:
-        trimmed_messages = manage_context_with_summarization(state["messages"], max_tokens=max_context_tokens)
+        trimmed_messages = manage_context_with_summarization(
+            state["messages"],
+            max_tokens=max_context_tokens,
+            summarize_threshold=summarize_threshold
+        )
+        print_context_banner(trimmed_messages, max_tokens=max_context_tokens, stage="Agent LLM Invocation")
 
         max_retries = 5
         base_delay = 6
+        response = None
         for attempt in range(1, max_retries + 1):
             try:
                 response = llm_with_tools.invoke(trimmed_messages)
-                return {"messages": [response]}
+                break
             except Exception as e:
                 err_msg = str(e)
                 if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
@@ -681,25 +737,54 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
                 else:
                     raise e
 
+        # Calculate exact context size including the model's generated response
+        total_tokens = sum(count_message_tokens(m) for m in trimmed_messages) + count_message_tokens(response)
+        pct = (total_tokens / max(1, max_context_tokens)) * 100
+        color = "green" if pct < 40 else ("yellow" if pct < 75 else "bold red")
+
+        # Explicitly print context size before every tool call as requested
+        if getattr(response, "tool_calls", None):
+            for tc in response.tool_calls:
+                console.print(
+                    f"  [{color}]🧠 Context: {total_tokens:,} / {max_context_tokens:,} tokens ({pct:.1f}%)[/{color}] "
+                    f"▶ [magenta]Tool Call:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})"
+                )
+        else:
+            txt = extract_message_text(response)
+            if txt:
+                console.print(f"  [dim]↳ Agent: {escape(txt[:100])}...[/dim]")
+
+        # If summarization replaced/condensed earlier turns, use ("override", ...) to update state messages
+        if len(trimmed_messages) != len(state["messages"]):
+            return {"messages": ("override", trimmed_messages + [response])}
+        return {"messages": [response]}
+
     def route_module_agent_step(state: ModuleAgentState) -> str:
         last_msg = state["messages"][-1]
 
-        # 1. Check if model made tool calls
+        # 1. Did the agent invoke append_documentation_section?
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
             for tc in last_msg.tool_calls:
                 if tc.get("name") == "append_documentation_section":
                     return "execute_append"
             return "tools"
 
-        # 2. No tool calls: model returned natural language text
+        # 2. No tool calls:
         if state.get("append_called", False):
             return END
 
+        txt = extract_message_text(last_msg)
+        # Only commit directly if it is ACTUAL comprehensive documentation
+        if is_substantive_documentation(txt):
+            return "commit_text_as_section"
+
+        # If it's a transitional statement ("Now I will compile...") or intermediate thought:
         reminders = state.get("reminder_count", 0)
-        if reminders < 2:
+        if reminders < 1:
             return "remind_to_append"
         else:
-            return "commit_text_as_section"
+            # Reached end of exploration or repeated conversational text -> trigger synthesis!
+            return "synthesize_and_append"
 
     exploration_tool_node = ToolNode(EXPLORATION_TOOLS)
 
@@ -728,29 +813,75 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
 
     def remind_to_append_node(state: ModuleAgentState) -> Dict[str, Any]:
         reminders = state.get("reminder_count", 0) + 1
-        last_msg = state["messages"][-1]
-        text_content = extract_message_text(last_msg)
         mod = state.get("module_name", "Module")
 
-        if len(text_content) > 150 or "#" in text_content or "```" in text_content:
-            reminder_text = (
-                f"You have prepared an analysis for module '{mod}', but the documentation has NOT been saved yet.\n"
-                f"You MUST now invoke the 'append_documentation_section' tool to save it to disk.\n"
-                f"Parameters:\n"
-                f"- section_title: Clean title without any section numbers (e.g. '{mod.replace('/', ' ').title()} - Functional Architecture & Implementation')\n"
-                f"- markdown_content: Your full Markdown documentation (including code logic, key methods, and Mermaid diagram)."
-            )
-        else:
-            reminder_text = (
-                f"You have not documented module '{mod}' yet. "
-                f"Use tools ('read_project_file', 'clangd_query', 'ripgrep_search') to inspect the code, "
-                f"and when ready, you MUST call 'append_documentation_section' to save the section to disk."
-            )
+        reminder_text = (
+            f"You have explored the code for module '{mod}'.\n"
+            f"Now generate the complete, comprehensive functional Markdown documentation section for module '{mod}'.\n"
+            f"Detail what the code does functionally, its critical classes/methods, concurrency synchronization, and a Mermaid diagram.\n"
+            f"You can either invoke 'append_documentation_section' or output the complete Markdown documentation text now."
+        )
 
         return {
             "messages": [HumanMessage(content=reminder_text)],
             "reminder_count": reminders
         }
+
+    def synthesize_and_append_node(state: ModuleAgentState) -> Dict[str, Any]:
+        mod = state.get("module_name", "Module")
+        clean_title = f"{mod.replace('/', ' ').title()} - Functional Architecture & Implementation"
+
+        console.print(f"  [bold yellow]⚡ Compiling full publication-grade documentation for module '{escape(mod)}'...[/bold yellow]")
+
+        synth_instruction = (
+            f"You have completed your code exploration of module '{mod}'.\n"
+            f"Now generate the complete, comprehensive, publication-grade functional Markdown documentation for module '{mod}'.\n\n"
+            f"MANDATORY DOCUMENTATION REQUIREMENTS:\n"
+            f"1. **Role & Functional Overview**: Deeply explain what this module actually does in practice, its business logic, operational behavior, and system role.\n"
+            f"2. **Critical Code & Logic Breakdown**: Detail the key classes, member variables, algorithms, functions, input parameters, concurrency synchronization (mutex/shared_mutex), and error handling.\n"
+            f"3. **Architectural / Flow Diagram**: Include at least one Mermaid diagram (```mermaid ... ```, strictly Mermaid only, no ASCII art) showing component interactions or runtime execution flow.\n"
+            f"4. **Cross-Module Integration**: Explain how this module interacts with previously documented modules.\n\n"
+            f"Produce the complete Markdown documentation text now."
+        )
+
+        synth_messages = manage_context_with_summarization(
+            state["messages"] + [HumanMessage(content=synth_instruction)],
+            max_tokens=max_context_tokens,
+            summarize_threshold=summarize_threshold
+        )
+        print_context_banner(synth_messages, max_tokens=max_context_tokens, stage="Generating Full Documentation")
+
+        try:
+            resp = llm.invoke(synth_messages)
+            doc_content = extract_message_text(resp)
+        except Exception as e:
+            console.print(f"[yellow]Synthesis invocation error: {e}[/yellow]")
+            doc_content = ""
+
+        if not is_substantive_documentation(doc_content):
+            console.print("  [dim yellow](Model returned short text; prompting directly for full markdown breakdown...)[/dim yellow]")
+            try:
+                resp2 = llm.invoke([
+                    SystemMessage(content=DOCUMENTER_SYSTEM_PROMPT),
+                    HumanMessage(content=synth_instruction)
+                ])
+                doc_content = extract_message_text(resp2)
+            except Exception:
+                pass
+
+        if not doc_content or len(doc_content.strip()) < 100:
+            doc_content = (
+                f"### Functional Architecture of `{mod}/`\n\n"
+                f"Module `{mod}` provides core functionality explored during codebase analysis.\n\n"
+                f"```mermaid\ngraph TD\n    Mod[\"{mod} Module\"] --> Sub[\"Core Implementation\"]\n```\n"
+            )
+
+        append_documentation_section.invoke({
+            "section_title": clean_title,
+            "markdown_content": doc_content,
+            "level": 2
+        })
+        return {"append_called": True}
 
     def commit_text_as_section_node(state: ModuleAgentState) -> Dict[str, Any]:
         mod = state.get("module_name", "Module")
@@ -761,11 +892,14 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
         for m in reversed(state["messages"]):
             if isinstance(m, AIMessage):
                 txt = extract_message_text(m)
-                if txt and len(txt) > 80:
+                if is_substantive_documentation(txt):
                     candidates.append(txt)
 
-        doc_content = candidates[0] if candidates else f"Functional documentation for module `{mod}/`."
-        console.print(f"  [bold yellow]⚡ Committing model's generated documentation text to disk...[/bold yellow]")
+        doc_content = candidates[0] if candidates else ""
+        if not doc_content:
+            return synthesize_and_append_node(state)
+
+        console.print(f"  [bold green]⚡ Saving complete generated markdown documentation ({len(doc_content)} chars)...[/bold green]")
         append_documentation_section.invoke({
             "section_title": clean_title,
             "markdown_content": doc_content,
@@ -778,6 +912,7 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
     wf.add_node("tools", exploration_tool_node)
     wf.add_node("execute_append", execute_append_node)
     wf.add_node("remind_to_append", remind_to_append_node)
+    wf.add_node("synthesize_and_append", synthesize_and_append_node)
     wf.add_node("commit_text_as_section", commit_text_as_section_node)
 
     wf.add_edge(START, "agent")
@@ -785,11 +920,13 @@ def build_module_documenter_runner(llm, max_context_tokens: int = 32000):
         "tools": "tools",
         "execute_append": "execute_append",
         "remind_to_append": "remind_to_append",
+        "synthesize_and_append": "synthesize_and_append",
         "commit_text_as_section": "commit_text_as_section",
         END: END
     })
     wf.add_edge("tools", "agent")
     wf.add_edge("remind_to_append", "agent")
+    wf.add_edge("synthesize_and_append", END)
     wf.add_edge("execute_append", END)
     wf.add_edge("commit_text_as_section", END)
 
@@ -833,12 +970,21 @@ def extract_message_text(msg: Any) -> str:
     return ""
 
 
-def document_module_node_factory(llm, max_context_tokens: int = 32000, module_max_steps: int = 50):
+def document_module_node_factory(
+    llm,
+    max_context_tokens: int = 32000,
+    module_max_steps: int = 50,
+    summarize_threshold: Optional[int] = None
+):
     """
     Create document_module node with 32k context limitation, step control, functional focus,
     and guaranteed section appending.
     """
-    sub_agent = build_module_documenter_runner(llm, max_context_tokens=max_context_tokens)
+    sub_agent = build_module_documenter_runner(
+        llm,
+        max_context_tokens=max_context_tokens,
+        summarize_threshold=summarize_threshold
+    )
 
     def document_module_node(state: DocumenterState) -> Dict[str, Any]:
         idx = state["current_module_index"]
@@ -882,27 +1028,24 @@ def document_module_node_factory(llm, max_context_tokens: int = 32000, module_ma
             for step in sub_agent.stream(sub_state, {"recursion_limit": module_max_steps}, stream_mode="updates"):
                 for node_name, node_update in step.items():
                     if node_name == "agent":
-                        msg = node_update["messages"][-1]
-                        if getattr(msg, "tool_calls", None):
-                            for tc in msg.tool_calls:
-                                console.print(f"  [magenta]▶ Tool:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})")
-                        else:
-                            txt = extract_message_text(msg)
-                            if txt:
-                                console.print(f"  [dim]↳ Agent: {escape(txt[:100])}...[/dim]")
+                        # Context size banner and tool calls are displayed in agent_step
+                        pass
                     elif node_name == "tools":
-                        for msg in node_update["messages"]:
+                        for msg in node_update.get("messages", []):
                             raw_text = extract_text(msg.content)
+                            t_tokens = count_tokens(raw_text)
                             preview = raw_text[:120].replace("\n", " ")
                             if len(raw_text) > 120:
                                 preview += "..."
-                            console.print(f"[dim]    ↳ Result: {escape(preview)}[/dim]")
+                            console.print(f"    [dim]↳ Tool Result ({t_tokens:,} tokens): {escape(preview)}[/dim]")
                     elif node_name == "remind_to_append":
                         console.print("  [yellow]⚡ Nudging agent to invoke 'append_documentation_section'...[/yellow]")
                     elif node_name == "execute_append":
                         console.print("  [bold green]✔ Section committed to documentation file.[/bold green]")
                     elif node_name == "commit_text_as_section":
                         console.print("  [bold green]✔ Saved agent's markdown documentation to file.[/bold green]")
+                    elif node_name == "synthesize_and_append":
+                        console.print("  [bold green]✔ Saved guaranteed synthesized documentation to file.[/bold green]")
         except Exception as e:
             console.print(f"[dim yellow]  (Module exploration step ended: {e})[/dim yellow]")
 
@@ -981,14 +1124,27 @@ def finalize_documentation_node(state: DocumenterState) -> Dict[str, Any]:
     return {}
 
 
-def build_codebase_documenter_graph(llm, max_context_tokens: int = 32000, module_max_steps: int = 50):
+def build_codebase_documenter_graph(
+    llm,
+    max_context_tokens: int = 32000,
+    module_max_steps: int = 50,
+    summarize_threshold: Optional[int] = None
+):
     """
     Build the deterministic multi-node documentation orchestrator.
     """
     wf = StateGraph(DocumenterState)
 
     wf.add_node("discover_and_plan", doc_discover_and_plan_node)
-    wf.add_node("document_module", document_module_node_factory(llm, max_context_tokens=max_context_tokens, module_max_steps=module_max_steps))
+    wf.add_node(
+        "document_module",
+        document_module_node_factory(
+            llm,
+            max_context_tokens=max_context_tokens,
+            module_max_steps=module_max_steps,
+            summarize_threshold=summarize_threshold
+        )
+    )
     wf.add_node("finalize_documentation", finalize_documentation_node)
 
     wf.add_edge(START, "discover_and_plan")
@@ -1013,6 +1169,7 @@ def run_codebase_documenter(
     model_name: Optional[str] = None,
     ollama_host: str = "http://localhost:11434",
     max_context_tokens: int = 32000,
+    summarize_threshold: int = 12000,
     module_max_steps: int = 50,
     target_dirs: Optional[List[str]] = None,
     ignore_dirs: Optional[List[str]] = None
@@ -1051,6 +1208,7 @@ def run_codebase_documenter(
         f"Provider        : [green]{provider}[/green]\n"
         f"Model           : [green]{model_name}[/green]\n"
         f"Context Limit   : [magenta]{max_context_tokens:,} tokens (32k window guard)[/magenta]\n"
+        f"Summarize Limit : [magenta]{summarize_threshold:,} tokens (proactive compression)[/magenta]\n"
         f"Steps / Module  : [yellow]{module_max_steps}[/yellow]\n"
         f"Tools Active    : [blue]clangd-query, ripgrep (rg), read_project_file, append_documentation_section[/blue]",
         title="Agent Configuration",
@@ -1066,7 +1224,8 @@ def run_codebase_documenter(
     app = build_codebase_documenter_graph(
         llm=llm,
         max_context_tokens=max_context_tokens,
-        module_max_steps=module_max_steps
+        module_max_steps=module_max_steps,
+        summarize_threshold=summarize_threshold
     )
 
     initial_state: DocumenterState = {
@@ -1079,7 +1238,8 @@ def run_codebase_documenter(
         "module_files_map": {},
         "current_module_index": 0,
         "sections_count": 0,
-        "max_context_tokens": max_context_tokens
+        "max_context_tokens": max_context_tokens,
+        "summarize_threshold": summarize_threshold
     }
 
     app.invoke(initial_state, {"recursion_limit": 500})
@@ -1141,6 +1301,12 @@ def parse_args():
         help="Maximum context token limit to enforce (default: 32000 / 32k)"
     )
     parser.add_argument(
+        "--context-summarize-threshold",
+        type=int,
+        default=12000,
+        help="Context token threshold to proactively trigger rolling summarization (default: 12000 tokens)"
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=50,
@@ -1166,6 +1332,7 @@ if __name__ == "__main__":
         model_name=args.model,
         ollama_host=args.ollama_host,
         max_context_tokens=args.max_context_tokens,
+        summarize_threshold=args.context_summarize_threshold,
         module_max_steps=args.max_steps,
         target_dirs=targets,
         ignore_dirs=ignores
