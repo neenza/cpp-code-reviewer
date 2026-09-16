@@ -109,7 +109,7 @@ def print_context_banner(messages: List[BaseMessage], max_tokens: int, stage: st
     total_tokens = sum(count_message_tokens(m) for m in messages)
     pct = (total_tokens / max(1, max_tokens)) * 100
     color = "green" if pct < 40 else ("yellow" if pct < 75 else "bold red")
-    console.print(f"  [{color}]🧠 Context: {total_tokens:,} / {max_tokens:,} tokens ({pct:.1f}%) | {stage}[/{color}]")
+    console.print(f"  [{color}][Context: {total_tokens:,} / {max_tokens:,} tokens ({pct:.1f}%)] | {stage}[/{color}]")
     return total_tokens
 
 
@@ -179,7 +179,7 @@ def manage_context_with_summarization(
 
     # Step 2: Context exceeds strict limit -> Perform Rolling Technical Summarization
     console.print(
-        f"\n  [bold yellow]⚡ Context reached {cur_tokens:,} tokens (exceeding strict threshold {effective_limit:,}). "
+        f"\n  [bold yellow][Notice] Context reached {cur_tokens:,} tokens (exceeding strict threshold {effective_limit:,}). "
         f"Active Rolling Summarization initiated...[/bold yellow]"
     )
 
@@ -210,7 +210,7 @@ def manage_context_with_summarization(
     new_messages = preserved_header + [summary_message] + recent_active_turns
     new_tokens = sum(count_message_tokens(m) for m in new_messages)
     saved = cur_tokens - new_tokens
-    console.print(f"  [bold green]✔ Context condensed from {cur_tokens:,} down to {new_tokens:,} tokens (-{(saved/max(1, cur_tokens))*100:.1f}%, saved {saved:,} tokens).[/bold green]\n")
+    console.print(f"  [bold green][OK] Context condensed from {cur_tokens:,} down to {new_tokens:,} tokens (-{(saved/max(1, cur_tokens))*100:.1f}%, saved {saved:,} tokens).[/bold green]\n")
     return new_messages
 
 
@@ -407,7 +407,7 @@ def append_documentation_section(
             "preview": markdown_content[:120].replace("\n", " ")
         })
 
-        console.print(f"  [bold green]📝 Appended Section (Level {level}):[/bold green] [cyan]{escape(numbered_title)}[/cyan]")
+        console.print(f"  [bold green][Appended Section (Level {level})]:[/bold green] [cyan]{escape(numbered_title)}[/cyan]")
         return f"Successfully appended section '{numbered_title}' ({len(markdown_content)} chars) to documentation file. Total sections: {len(_DOCUMENTED_SECTIONS)}."
     except Exception as e:
         return f"Error writing to documentation file: {e}"
@@ -452,12 +452,13 @@ Your task is to generate clear, comprehensive, functional, publication-grade Mar
 
 ════════════════════════════════════════════════════════════════════════════════
 CORE INSTRUCTIONS & STANDARDS:
-1. 📂 INCREMENTAL OUTPUT & CLEAN TITLES:
-   - Call `append_documentation_section` as soon as you finish investigating each module or major workflow.
+1. INCREMENTAL DOCUMENTATION & CLEAN TITLES:
+   - Document incrementally! Call `append_documentation_section` as you finish investigating each key component, file, or subsystem—do NOT wait until the very end to document everything at once.
+   - For a module's main architecture overview, use level=2 ('##'). For individual files, classes, algorithms, or subsystems within the module, use level=3 ('###').
    - DO NOT provide section numbers in `section_title` (e.g. do NOT write 'Section 2' or '3. ...').
      Provide ONLY the descriptive semantic title (e.g. 'Order Processing Engine & Payment Workflow').
      Section numbers are automatically tracked and prefixed for you in sequence.
-2. ⚙️ FOCUS ON FUNCTIONAL EXPLANATION & CODE INNER LOGIC:
+2. FOCUS ON FUNCTIONAL EXPLANATION & CODE INNER LOGIC:
    - Do NOT just produce a dry list of class names and field types.
    - Deeply explain WHAT the code does functionally: business logic, operational behavior, workflows, and state transitions.
    - EXPLAIN THE CRITICAL PARTS OF THE CODE:
@@ -465,11 +466,11 @@ CORE INSTRUCTIONS & STANDARDS:
      * Explain input validations, data transformations, error handling, return codes, and side effects.
      * Describe edge cases, failure recoveries, and performance considerations.
      * Explain dynamic interactions: trace how caller functions pass data into methods and what downstream effects occur.
-3. 🎯 TECHNICAL ACCURACY & CONCRETENESS:
+3. TECHNICAL ACCURACY & CONCRETENESS:
    - Always cite exact source files, classes, methods, and line numbers (`include/order_repository.h`).
    - Use `clangd_query` (`show`, `interface`, `hierarchy`, `signature`) to inspect actual implementations and method bodies.
    - Use `ripgrep_search` to verify concurrency primitives (`mutex`, `shared_mutex`, `atomic`) and resource ownership (`std::unique_ptr`, `std::shared_ptr`, RAII).
-4. 📊 DIAGRAMS & FLOWCHARTS (MERMAID ONLY):
+4. DIAGRAMS & FLOWCHARTS (MERMAID ONLY):
    - Whenever illustrating architecture, class relationships, state transitions, or execution flows, you MUST use Mermaid diagrams ONLY inside fenced code blocks (` ```mermaid ... ``` `).
    - Do NOT use ASCII art, plain text boxes, or pseudo-code drawings for diagrams.
    - Supported Mermaid types:
@@ -477,10 +478,10 @@ CORE INSTRUCTIONS & STANDARDS:
      * `sequenceDiagram` for method call sequences and dynamic component interactions.
      * `classDiagram` for class inheritance and interface relationships.
    - Ensure valid Mermaid syntax: quote node labels containing special characters (parentheses, braces, brackets), e.g. `id["OrderRepository (Thread-Safe)"]`.
-5. 🧠 CONTEXT EFFICIENCY (32k LIMIT):
+5. CONTEXT EFFICIENCY (32k LIMIT):
    - Keep tool queries targeted and focused.
    - Append sections incrementally to keep the context window compact and clean.
-6. 🔗 CROSS-MODULE ARCHITECTURAL MEMORY & CONTINUITY:
+6. CROSS-MODULE ARCHITECTURAL MEMORY & CONTINUITY:
    - When moving between folders, you have access to the ARCHITECTURAL MEMORY of all previously documented modules.
    - Explicitly link your explanations to components established in prior sections (e.g. refer to classes/interfaces defined in header folders when analyzing implementation folders).
    - Avoid redundant duplication: build upon existing abstractions rather than re-explaining them from scratch.
@@ -560,7 +561,7 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
 
     console.print(f"[green]Discovered {len(all_files)} total C++ files across {len(sorted_modules)} directories/modules.[/green]")
     for mod in sorted_modules:
-        console.print(f"  📁 [bold]{escape(mod)}/[/bold] ({len(module_map[mod])} files)")
+        console.print(f"  - [bold]{escape(mod)}/[/bold] ({len(module_map[mod])} files)")
 
     # 1. Detect Entry Point (where application starts execution)
     entry_point_files: List[str] = []
@@ -577,7 +578,7 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     entry_point_module = None
     if entry_point_files:
         entry_point_module = str(Path(entry_point_files[0]).parent)
-        console.print(f"\n[bold cyan]🎯 Starting Point Detected:[/bold cyan] [green]{entry_point_files[0]}[/green] (Module: [yellow]{entry_point_module}/[/yellow])")
+        console.print(f"\n[bold cyan][Starting Point Detected]:[/bold cyan] [green]{entry_point_files[0]}[/green] (Module: [yellow]{entry_point_module}/[/yellow])")
     else:
         for mod in sorted_modules:
             if "include" in mod.lower() or mod == ".":
@@ -598,7 +599,7 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
             modules_to_document = filtered
             console.print(f"\n[bold green]Target Scope Applied:[/bold green] Queued {len(modules_to_document)} module(s) under [{', '.join(norm_targets)}] for documentation:")
             for mod in modules_to_document:
-                console.print(f"  🎯 [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files)")
+                console.print(f"  * [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files)")
             console.print("[dim]Note: Other folders can still be queried by clangd-query/rg for references if needed.[/dim]\n")
         else:
             console.print(f"[yellow]Warning: No modules matched target directories: {target_dirs}. Documenting all discovered modules.[/yellow]")
@@ -626,7 +627,7 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
 
     console.print(f"\n[bold green]Determined Documentation Order ({len(modules_to_document)} modules):[/bold green]")
     for rank, mod in enumerate(modules_to_document, 1):
-        tag = " [bold magenta]★ Entry Point[/bold magenta]" if (entry_point_module and mod == entry_point_module) else ""
+        tag = " [bold magenta][Entry Point][/bold magenta]" if (entry_point_module and mod == entry_point_module) else ""
         console.print(f"  {rank}. [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files){tag}")
 
     # Read CMakeLists.txt to build Section 1
@@ -657,7 +658,7 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
 
     sec1_content += "### Directory & Module Layout\n"
     for mod in sorted_modules:
-        marker = "🎯 *(Documented)*" if mod in modules_to_document else "📦 *(Reference)*"
+        marker = "*(Documented)*" if mod in modules_to_document else "*(Reference)*"
         sec1_content += f"- **`{mod}/`** ({len(module_map[mod])} files) {marker}:\n"
         for f in module_map[mod][:8]:
             sec1_content += f"  - `{Path(f).name}`\n"
@@ -697,6 +698,7 @@ class ModuleAgentState(TypedDict):
     messages: Annotated[List[BaseMessage], message_reducer]
     module_name: str
     append_called: bool
+    append_count: int
     reminder_count: int
 
 
@@ -707,7 +709,8 @@ def build_module_documenter_runner(
 ):
     """
     Build focused LangGraph sub-agent for documenting a specific directory module,
-    strictly bounded by proactive context limits and guaranteed synthesis.
+    strictly bounded by proactive context limits, incremental in-module documentation,
+    and guaranteed synthesis.
     """
     llm_with_tools = llm.bind_tools(DOCUMENTER_TOOLS)
 
@@ -746,13 +749,13 @@ def build_module_documenter_runner(
         if getattr(response, "tool_calls", None):
             for tc in response.tool_calls:
                 console.print(
-                    f"  [{color}]🧠 Context: {total_tokens:,} / {max_context_tokens:,} tokens ({pct:.1f}%)[/{color}] "
-                    f"▶ [magenta]Tool Call:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})"
+                    f"  [{color}][Context: {total_tokens:,} / {max_context_tokens:,} tokens ({pct:.1f}%)][/{color}] "
+                    f"| [magenta]Tool Call:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})"
                 )
         else:
             txt = extract_message_text(response)
             if txt:
-                console.print(f"  [dim]↳ Agent: {escape(txt[:100])}...[/dim]")
+                console.print(f"  [dim]Agent: {escape(txt[:100])}...[/dim]")
 
         # If summarization replaced/condensed earlier turns, use ("override", ...) to update state messages
         if len(trimmed_messages) != len(state["messages"]):
@@ -791,12 +794,26 @@ def build_module_documenter_runner(
     def execute_append_node(state: ModuleAgentState) -> Dict[str, Any]:
         last_msg = state["messages"][-1]
         tool_messages = []
+        appends_in_this_step = 0
+        mod = state.get("module_name", "Module")
+        prior_appends = state.get("append_count", 0)
+
         for tc in getattr(last_msg, "tool_calls", []):
             if tc.get("name") == "append_documentation_section":
-                args = tc.get("args", {})
+                args = dict(tc.get("args", {}))
+                # Automatic subsection nesting inside module:
+                total_appends = prior_appends + appends_in_this_step
+                if total_appends > 0 and args.get("level", 2) <= 2:
+                    args["level"] = 3
                 res = append_documentation_section.invoke(args)
+                appends_in_this_step += 1
                 tool_messages.append(ToolMessage(
-                    content=str(res),
+                    content=(
+                        f"{res}\n"
+                        f"[Next Step: You can continue exploring and documenting other files or subsystems in module '{mod}' "
+                        f"by calling 'read_project_file' or 'append_documentation_section'. When all files/components in '{mod}' "
+                        f"have been documented, reply stating that documentation for this module is complete (with no further tool calls).]"
+                    ),
                     tool_call_id=tc.get("id", "append_id"),
                     name="append_documentation_section"
                 ))
@@ -809,7 +826,11 @@ def build_module_documenter_runner(
                             tool_call_id=tc.get("id", "tool_id"),
                             name=t.name
                         ))
-        return {"messages": tool_messages, "append_called": True}
+        return {
+            "messages": tool_messages,
+            "append_called": True,
+            "append_count": prior_appends + appends_in_this_step
+        }
 
     def remind_to_append_node(state: ModuleAgentState) -> Dict[str, Any]:
         reminders = state.get("reminder_count", 0) + 1
@@ -817,7 +838,7 @@ def build_module_documenter_runner(
 
         reminder_text = (
             f"You have explored the code for module '{mod}'.\n"
-            f"Now generate the complete, comprehensive functional Markdown documentation section for module '{mod}'.\n"
+            f"Now generate the functional Markdown documentation section for module '{mod}'.\n"
             f"Detail what the code does functionally, its critical classes/methods, concurrency synchronization, and a Mermaid diagram.\n"
             f"You can either invoke 'append_documentation_section' or output the complete Markdown documentation text now."
         )
@@ -831,7 +852,7 @@ def build_module_documenter_runner(
         mod = state.get("module_name", "Module")
         clean_title = f"{mod.replace('/', ' ').title()} - Functional Architecture & Implementation"
 
-        console.print(f"  [bold yellow]⚡ Compiling full publication-grade documentation for module '{escape(mod)}'...[/bold yellow]")
+        console.print(f"  [bold yellow][Notice] Compiling full publication-grade documentation for module '{escape(mod)}'...[/bold yellow]")
 
         synth_instruction = (
             f"You have completed your code exploration of module '{mod}'.\n"
@@ -881,7 +902,7 @@ def build_module_documenter_runner(
             "markdown_content": doc_content,
             "level": 2
         })
-        return {"append_called": True}
+        return {"append_called": True, "append_count": state.get("append_count", 0) + 1}
 
     def commit_text_as_section_node(state: ModuleAgentState) -> Dict[str, Any]:
         mod = state.get("module_name", "Module")
@@ -899,13 +920,13 @@ def build_module_documenter_runner(
         if not doc_content:
             return synthesize_and_append_node(state)
 
-        console.print(f"  [bold green]⚡ Saving complete generated markdown documentation ({len(doc_content)} chars)...[/bold green]")
+        console.print(f"  [bold green][Notice] Saving complete generated markdown documentation ({len(doc_content)} chars)...[/bold green]")
         append_documentation_section.invoke({
             "section_title": clean_title,
             "markdown_content": doc_content,
             "level": 2
         })
-        return {"append_called": True}
+        return {"append_called": True, "append_count": state.get("append_count", 0) + 1}
 
     wf = StateGraph(ModuleAgentState)
     wf.add_node("agent", agent_step)
@@ -927,7 +948,7 @@ def build_module_documenter_runner(
     wf.add_edge("tools", "agent")
     wf.add_edge("remind_to_append", "agent")
     wf.add_edge("synthesize_and_append", END)
-    wf.add_edge("execute_append", END)
+    wf.add_edge("execute_append", "agent")
     wf.add_edge("commit_text_as_section", END)
 
     return wf.compile()
@@ -1000,16 +1021,14 @@ def document_module_node_factory(
             f"You are writing in-depth functional C++ documentation for module '{current_module}'.\n"
             f"Files in this module:\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
             f"{arch_memory}\n\n"
-            f"TASK & WORKFLOW FOR THIS MODULE:\n"
-            f"1. EXPLORE: Use 'read_project_file' or 'clangd_query' ('show', 'interface', 'signature') to inspect the code.\n"
-            f"2. FUNCTIONAL EXPLANATION: Explain what this module actually does in practice, its business logic, operational behavior, and role in the system.\n"
-            f"   CROSS-REFERENCE: Explicitly connect this module to previously documented components listed in the architectural memory above.\n"
+            f"TASK & INCREMENTAL DOCUMENTATION WORKFLOW FOR THIS MODULE:\n"
+            f"You can document incrementally as you explore—do NOT wait until the very end to document everything at once!\n"
+            f"1. INITIAL / OVERVIEW SECTION: As you understand the module's role, invoke 'append_documentation_section' with level=2 for the module's architecture and layout.\n"
+            f"2. INCREMENTAL COMPONENT SECTIONS: As you explore individual key files or subsystems in this module, invoke 'append_documentation_section' (with level=3) to document each component's functional behavior, inner code algorithms, and concurrency mechanics.\n"
             f"3. CODE DETAILS: Detail key classes, member variables, functions, input parameters, concurrency locks (mutex/shared_mutex), and error handling.\n"
-            f"4. MERMAID DIAGRAM: Include at least one Mermaid diagram (strictly Mermaid only inside ```mermaid ... ```, no ASCII art) showing execution flow or relationships with other modules.\n"
-            f"5. COMMIT DOCUMENTATION: You MUST invoke the 'append_documentation_section' tool to save your documentation to disk.\n"
-            f"   - 'section_title': Semantic title WITHOUT any section numbers (e.g. '{current_module.replace('/', ' ').title()} - Functional Architecture & Implementation')\n"
-            f"   - 'markdown_content': The complete Markdown documentation text.\n"
-            f"Call 'read_project_file' or 'clangd_query' to begin exploration now."
+            f"4. MERMAID DIAGRAMS: Include Mermaid diagrams (strictly Mermaid only inside ```mermaid ... ```, no ASCII art) showing execution flow or relationships with other modules.\n"
+            f"5. FINISHING THE MODULE: Once all files/components in '{current_module}' have been documented, reply stating that documentation for this module is complete (with no more tool calls) to conclude the module.\n\n"
+            f"Begin by exploring the first file or structure using 'read_project_file' or 'clangd_query'."
         )
 
         sub_state: ModuleAgentState = {
@@ -1019,6 +1038,7 @@ def document_module_node_factory(
             ],
             "module_name": current_module,
             "append_called": False,
+            "append_count": 0,
             "reminder_count": 0
         }
 
@@ -1037,15 +1057,15 @@ def document_module_node_factory(
                             preview = raw_text[:120].replace("\n", " ")
                             if len(raw_text) > 120:
                                 preview += "..."
-                            console.print(f"    [dim]↳ Tool Result ({t_tokens:,} tokens): {escape(preview)}[/dim]")
+                            console.print(f"    [dim]Tool Result ({t_tokens:,} tokens): {escape(preview)}[/dim]")
                     elif node_name == "remind_to_append":
-                        console.print("  [yellow]⚡ Nudging agent to invoke 'append_documentation_section'...[/yellow]")
+                        console.print("  [yellow][Notice] Nudging agent to invoke 'append_documentation_section'...[/yellow]")
                     elif node_name == "execute_append":
-                        console.print("  [bold green]✔ Section committed to documentation file.[/bold green]")
+                        console.print("  [bold green][OK] Section committed to documentation file.[/bold green]")
                     elif node_name == "commit_text_as_section":
-                        console.print("  [bold green]✔ Saved agent's markdown documentation to file.[/bold green]")
+                        console.print("  [bold green][OK] Saved agent's markdown documentation to file.[/bold green]")
                     elif node_name == "synthesize_and_append":
-                        console.print("  [bold green]✔ Saved guaranteed synthesized documentation to file.[/bold green]")
+                        console.print("  [bold green][OK] Saved guaranteed synthesized documentation to file.[/bold green]")
         except Exception as e:
             console.print(f"[dim yellow]  (Module exploration step ended: {e})[/dim yellow]")
 
@@ -1069,7 +1089,7 @@ def document_module_node_factory(
             })
 
         pct = ((idx + 1) / len(modules)) * 100
-        console.print(f"[green]✔ Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
+        console.print(f"[green][OK] Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
 
         return {
             "current_module_index": idx + 1,
@@ -1119,7 +1139,7 @@ def finalize_documentation_node(state: DocumenterState) -> Dict[str, Any]:
         except Exception as e:
             console.print(f"[yellow]Warning updating TOC: {e}[/yellow]")
 
-    console.print(f"[bold green]✔ Documentation complete![/bold green] Total sections documented: {len(_DOCUMENTED_SECTIONS)}")
+    console.print(f"[bold green][OK] Documentation complete![/bold green] Total sections documented: {len(_DOCUMENTED_SECTIONS)}")
     console.print(f"[bold green]Saved to:[/bold green] [cyan]{out_file}[/cyan]\n")
     return {}
 

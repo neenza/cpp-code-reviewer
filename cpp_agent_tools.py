@@ -321,7 +321,7 @@ def list_project_structure(max_files_per_dir: int = 15) -> str:
 
     lines = [f"Project Root: {proj_path.name}/ ({len(all_files)} C++ files across {len(dir_map)} directories)\n"]
     for d, files in sorted(dir_map.items()):
-        lines.append(f"📁 {d}/ ({len(files)} files)")
+        lines.append(f"- {d}/ ({len(files)} files)")
         for f in files[:max_files_per_dir]:
             lines.append(f"   ├── {Path(f).name}")
         if len(files) > max_files_per_dir:
