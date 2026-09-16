@@ -356,9 +356,12 @@ def format_architectural_memory() -> str:
 
 @tool
 def append_documentation_section(
-    section_title: str,
-    markdown_content: str,
-    level: int = 2
+    section_title: Optional[str] = None,
+    markdown_content: Optional[str] = None,
+    title: Optional[str] = None,
+    content: Optional[str] = None,
+    level: int = 2,
+    **kwargs: Any
 ) -> str:
     """Incrementally write and append a new section to the codebase Markdown documentation file on disk.
     Call this tool as soon as you finish investigating a module, architectural component, or class hierarchy.
@@ -373,11 +376,17 @@ def append_documentation_section(
     global _DOC_OUTPUT_FILE, _DOCUMENTED_SECTIONS, _MAIN_SECTION_COUNTER, _SUB_SECTION_COUNTER
 
     import re
+
+    raw_title = section_title or title or kwargs.get("heading") or kwargs.get("name") or "Component Architecture & Implementation"
+    raw_content = markdown_content or content or kwargs.get("markdown") or kwargs.get("text") or ""
+    if not raw_content or len(raw_content.strip()) < 30:
+        return "Error: 'markdown_content' is required and must contain comprehensive markdown documentation text."
+
     # Strip any leading numbers, "Section X:", or Roman numerals the model may have generated
-    clean_title = re.sub(r'^(?:Section\s*)?(?:\d+[\.\-_:]\s*)+', '', section_title.strip(), flags=re.IGNORECASE).strip()
+    clean_title = re.sub(r'^(?:Section\s*)?(?:\d+[\.\-_:]\s*)+', '', raw_title.strip(), flags=re.IGNORECASE).strip()
     clean_title = re.sub(r'^(?:Section\s*)?[IVXLCDM]+[\.\-_:]\s*', '', clean_title, flags=re.IGNORECASE).strip()
     if not clean_title:
-        clean_title = section_title.strip()
+        clean_title = raw_title.strip()
 
     # Automatically generate strict, monotonic, sequential numbering
     if level <= 2:
@@ -389,14 +398,14 @@ def append_documentation_section(
         numbered_title = f"{_MAIN_SECTION_COUNTER}.{_SUB_SECTION_COUNTER} {clean_title}"
 
     prefix = "#" * max(1, min(level, 5))
-    formatted_chunk = f"{prefix} {numbered_title}\n\n{markdown_content.strip()}\n\n---\n\n"
+    formatted_chunk = f"{prefix} {numbered_title}\n\n{raw_content.strip()}\n\n---\n\n"
 
     try:
         with open(_DOC_OUTPUT_FILE, "a", encoding="utf-8") as f:
             f.write(formatted_chunk)
             f.flush()
 
-        summary = extract_section_summary(numbered_title, markdown_content)
+        summary = extract_section_summary(numbered_title, raw_content)
 
         _DOCUMENTED_SECTIONS.append({
             "title": numbered_title,
@@ -404,11 +413,11 @@ def append_documentation_section(
             "level": level,
             "timestamp": time.time(),
             "summary": summary,
-            "preview": markdown_content[:120].replace("\n", " ")
+            "preview": raw_content[:120].replace("\n", " ")
         })
 
         console.print(f"  [bold green][Appended Section (Level {level})]:[/bold green] [cyan]{escape(numbered_title)}[/cyan]")
-        return f"Successfully appended section '{numbered_title}' ({len(markdown_content)} chars) to documentation file. Total sections: {len(_DOCUMENTED_SECTIONS)}."
+        return f"Successfully appended section '{numbered_title}' ({len(raw_content)} chars) to documentation file. Total sections: {len(_DOCUMENTED_SECTIONS)}."
     except Exception as e:
         return f"Error writing to documentation file: {e}"
 
@@ -699,6 +708,7 @@ class ModuleAgentState(TypedDict):
     module_name: str
     append_called: bool
     append_count: int
+    uncommitted_explorations: int
     reminder_count: int
 
 
@@ -767,9 +777,16 @@ def build_module_documenter_runner(
 
         # 1. Did the agent invoke append_documentation_section?
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-            for tc in last_msg.tool_calls:
-                if tc.get("name") == "append_documentation_section":
-                    return "execute_append"
+            has_append = any(tc.get("name") == "append_documentation_section" for tc in last_msg.tool_calls)
+            if has_append:
+                return "execute_append"
+
+            # Agent wants to run exploration tools (read_project_file, clangd_query, ripgrep_search)
+            uncommitted = state.get("uncommitted_explorations", 0)
+            if uncommitted >= 2:
+                # Enforce documenting what was just explored before reading further files
+                return "enforce_append_now"
+
             return "tools"
 
         # 2. No tool calls:
@@ -789,7 +806,27 @@ def build_module_documenter_runner(
             # Reached end of exploration or repeated conversational text -> trigger synthesis!
             return "synthesize_and_append"
 
-    exploration_tool_node = ToolNode(EXPLORATION_TOOLS)
+    exploration_tool_node = ToolNode(EXPLORATION_TOOLS, handle_tool_errors=True)
+
+    def execute_exploration_tools_node(state: ModuleAgentState) -> Dict[str, Any]:
+        res = exploration_tool_node.invoke(state)
+        return {
+            "messages": res.get("messages", []),
+            "uncommitted_explorations": state.get("uncommitted_explorations", 0) + 1
+        }
+
+    def enforce_append_now_node(state: ModuleAgentState) -> Dict[str, Any]:
+        mod = state.get("module_name", "Module")
+        notice = (
+            f"[MANDATORY DOCUMENTATION CADENCE: You have explored code in module '{mod}'. "
+            f"To document incrementally as requested and prevent context overflow, you must NOT inspect further files right now. "
+            f"Invoke 'append_documentation_section' NOW to document the functional role, classes, inner algorithms, "
+            f"and concurrency of the component you just inspected before continuing!]"
+        )
+        return {
+            "messages": [HumanMessage(content=notice)],
+            "uncommitted_explorations": 0
+        }
 
     def execute_append_node(state: ModuleAgentState) -> Dict[str, Any]:
         last_msg = state["messages"][-1]
@@ -805,7 +842,10 @@ def build_module_documenter_runner(
                 total_appends = prior_appends + appends_in_this_step
                 if total_appends > 0 and args.get("level", 2) <= 2:
                     args["level"] = 3
-                res = append_documentation_section.invoke(args)
+                try:
+                    res = append_documentation_section.invoke(args)
+                except Exception as e:
+                    res = f"Error executing append_documentation_section: {e}"
                 appends_in_this_step += 1
                 tool_messages.append(ToolMessage(
                     content=(
@@ -820,7 +860,10 @@ def build_module_documenter_runner(
             else:
                 for t in EXPLORATION_TOOLS:
                     if t.name == tc.get("name"):
-                        res = t.invoke(tc.get("args", {}))
+                        try:
+                            res = t.invoke(tc.get("args", {}))
+                        except Exception as e:
+                            res = f"Error executing tool {t.name}: {e}"
                         tool_messages.append(ToolMessage(
                             content=str(res),
                             tool_call_id=tc.get("id", "tool_id"),
@@ -829,7 +872,8 @@ def build_module_documenter_runner(
         return {
             "messages": tool_messages,
             "append_called": True,
-            "append_count": prior_appends + appends_in_this_step
+            "append_count": prior_appends + appends_in_this_step,
+            "uncommitted_explorations": 0
         }
 
     def remind_to_append_node(state: ModuleAgentState) -> Dict[str, Any]:
@@ -902,7 +946,7 @@ def build_module_documenter_runner(
             "markdown_content": doc_content,
             "level": 2
         })
-        return {"append_called": True, "append_count": state.get("append_count", 0) + 1}
+        return {"append_called": True, "append_count": state.get("append_count", 0) + 1, "uncommitted_explorations": 0}
 
     def commit_text_as_section_node(state: ModuleAgentState) -> Dict[str, Any]:
         mod = state.get("module_name", "Module")
@@ -926,11 +970,12 @@ def build_module_documenter_runner(
             "markdown_content": doc_content,
             "level": 2
         })
-        return {"append_called": True, "append_count": state.get("append_count", 0) + 1}
+        return {"append_called": True, "append_count": state.get("append_count", 0) + 1, "uncommitted_explorations": 0}
 
     wf = StateGraph(ModuleAgentState)
     wf.add_node("agent", agent_step)
-    wf.add_node("tools", exploration_tool_node)
+    wf.add_node("tools", execute_exploration_tools_node)
+    wf.add_node("enforce_append_now", enforce_append_now_node)
     wf.add_node("execute_append", execute_append_node)
     wf.add_node("remind_to_append", remind_to_append_node)
     wf.add_node("synthesize_and_append", synthesize_and_append_node)
@@ -939,6 +984,7 @@ def build_module_documenter_runner(
     wf.add_edge(START, "agent")
     wf.add_conditional_edges("agent", route_module_agent_step, {
         "tools": "tools",
+        "enforce_append_now": "enforce_append_now",
         "execute_append": "execute_append",
         "remind_to_append": "remind_to_append",
         "synthesize_and_append": "synthesize_and_append",
@@ -946,6 +992,7 @@ def build_module_documenter_runner(
         END: END
     })
     wf.add_edge("tools", "agent")
+    wf.add_edge("enforce_append_now", "agent")
     wf.add_edge("remind_to_append", "agent")
     wf.add_edge("synthesize_and_append", END)
     wf.add_edge("execute_append", "agent")
@@ -1021,13 +1068,15 @@ def document_module_node_factory(
             f"You are writing in-depth functional C++ documentation for module '{current_module}'.\n"
             f"Files in this module:\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
             f"{arch_memory}\n\n"
-            f"TASK & INCREMENTAL DOCUMENTATION WORKFLOW FOR THIS MODULE:\n"
-            f"You can document incrementally as you explore—do NOT wait until the very end to document everything at once!\n"
-            f"1. INITIAL / OVERVIEW SECTION: As you understand the module's role, invoke 'append_documentation_section' with level=2 for the module's architecture and layout.\n"
-            f"2. INCREMENTAL COMPONENT SECTIONS: As you explore individual key files or subsystems in this module, invoke 'append_documentation_section' (with level=3) to document each component's functional behavior, inner code algorithms, and concurrency mechanics.\n"
-            f"3. CODE DETAILS: Detail key classes, member variables, functions, input parameters, concurrency locks (mutex/shared_mutex), and error handling.\n"
-            f"4. MERMAID DIAGRAMS: Include Mermaid diagrams (strictly Mermaid only inside ```mermaid ... ```, no ASCII art) showing execution flow or relationships with other modules.\n"
-            f"5. FINISHING THE MODULE: Once all files/components in '{current_module}' have been documented, reply stating that documentation for this module is complete (with no more tool calls) to conclude the module.\n\n"
+            f"MANDATORY INCREMENTAL DOCUMENTATION PROTOCOL:\n"
+            f"DO NOT read all files first! You must document each concept immediately as you explore it:\n"
+            f"1. OVERVIEW (Turn 1): Inspect the main header/CMake or entry structure. Immediately invoke 'append_documentation_section' with level=2 for the module's architecture and layout.\n"
+            f"2. COMPONENT ITERATION: For each key file or subsystem:\n"
+            f"   - Inspect that component using 'read_project_file' or 'clangd_query'.\n"
+            f"   - IMMEDIATELY invoke 'append_documentation_section' (with level=3) to document that component's functional role, inner algorithms, public methods, and concurrency synchronization.\n"
+            f"   - Do NOT inspect a new file until the previous one is documented!\n"
+            f"3. MERMAID DIAGRAMS: Include Mermaid diagrams (strictly inside ```mermaid ... ```, no ASCII art) showing component interactions.\n"
+            f"4. CONCLUDE: When all files/components in '{current_module}' have been documented, reply stating that documentation for this module is complete (with no more tool calls).\n\n"
             f"Begin by exploring the first file or structure using 'read_project_file' or 'clangd_query'."
         )
 
@@ -1039,6 +1088,7 @@ def document_module_node_factory(
             "module_name": current_module,
             "append_called": False,
             "append_count": 0,
+            "uncommitted_explorations": 0,
             "reminder_count": 0
         }
 
@@ -1058,6 +1108,8 @@ def document_module_node_factory(
                             if len(raw_text) > 120:
                                 preview += "..."
                             console.print(f"    [dim]Tool Result ({t_tokens:,} tokens): {escape(preview)}[/dim]")
+                    elif node_name == "enforce_append_now":
+                        console.print("  [yellow][Notice] Prompting agent to document current concept before reading more files...[/yellow]")
                     elif node_name == "remind_to_append":
                         console.print("  [yellow][Notice] Nudging agent to invoke 'append_documentation_section'...[/yellow]")
                     elif node_name == "execute_append":

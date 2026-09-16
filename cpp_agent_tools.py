@@ -78,9 +78,12 @@ def ensure_compile_commands(project_dir: Path) -> bool:
 
 @tool
 def clangd_query(
-    command: Literal["search", "show", "usages", "hierarchy", "signature", "interface"],
-    symbol_or_query: str,
-    limit: Optional[int] = None
+    command: str = "show",
+    symbol_or_query: Optional[str] = None,
+    query: Optional[str] = None,
+    symbol: Optional[str] = None,
+    limit: Optional[int] = None,
+    **kwargs: Any
 ) -> str:
     """Query semantic C++ code intelligence using clangd-query CLI.
     clangd-query provides token-optimized semantic understanding of C++ code,
@@ -102,7 +105,12 @@ def clangd_query(
     """
     global _ACTIVE_PROJECT_DIR
 
-    cmd = ["clangd-query", command, symbol_or_query]
+    resolved = symbol_or_query or query or symbol or kwargs.get("name") or kwargs.get("target") or ""
+    if not resolved:
+        return "Error: 'symbol_or_query' argument is required for clangd-query (e.g. clangd_query(command='show', symbol_or_query='MyClass'))."
+
+    cmd_str = command if command in ["search", "show", "usages", "hierarchy", "signature", "interface"] else "show"
+    cmd = ["clangd-query", cmd_str, resolved]
     if limit is not None and limit > 0:
         cmd.extend(["--limit", str(limit)])
 
@@ -116,24 +124,26 @@ def clangd_query(
         )
         output = (result.stdout + result.stderr).strip()
         if not output:
-            return f"[clangd-query {command} '{symbol_or_query}']: No output returned."
+            return f"[clangd-query {cmd_str} '{resolved}']: No output returned."
         return output
     except FileNotFoundError:
         return "Error: 'clangd-query' executable not found in PATH."
     except subprocess.TimeoutExpired:
-        return f"Error: 'clangd-query {command} {symbol_or_query}' timed out after 30 seconds."
+        return f"Error: 'clangd-query {cmd_str} {resolved}' timed out after 30 seconds."
     except Exception as e:
         return f"Error executing clangd-query: {e}"
 
 
 @tool
 def ripgrep_search(
-    pattern: str,
+    pattern: Optional[str] = None,
+    query: Optional[str] = None,
     path_filter: Optional[str] = None,
     case_insensitive: bool = False,
     is_regex: bool = True,
     file_names_only: bool = False,
-    max_results: int = 40
+    max_results: int = 40,
+    **kwargs: Any
 ) -> str:
     """Search codebase text using ripgrep (rg).
     Ideal for:
@@ -142,6 +152,10 @@ def ripgrep_search(
       - Finding preprocessor directives, CMake definitions, include statements, or comments
     """
     global _ACTIVE_PROJECT_DIR
+
+    resolved = pattern or query or kwargs.get("search") or kwargs.get("text") or ""
+    if not resolved:
+        return "Error: 'pattern' argument is required for ripgrep_search (e.g. ripgrep_search(pattern='mutex'))."
 
     cmd = ["rg", "--color=never", "--line-number"]
     if case_insensitive:
@@ -156,10 +170,11 @@ def ripgrep_search(
     # Exclude build directories and cache
     cmd.extend(["--glob", "!build/**", "--glob", "!.cache/**", "--glob", "!third_party/**", "--glob", "!vendor/**"])
 
-    cmd.append(pattern)
+    cmd.append(resolved)
 
-    if path_filter:
-        cmd.append(path_filter)
+    resolved_filter = path_filter or kwargs.get("path") or kwargs.get("dir")
+    if resolved_filter:
+        cmd.append(resolved_filter)
     else:
         cmd.append(".")
 
@@ -173,7 +188,7 @@ def ripgrep_search(
         )
         output = result.stdout.strip()
         if not output:
-            return f"[ripgrep '{pattern}']: No matches found in {path_filter or 'project'}."
+            return f"[ripgrep '{resolved}']: No matches found in {resolved_filter or 'project'}."
         
         lines = output.splitlines()
         if len(lines) > max_results:
@@ -183,30 +198,43 @@ def ripgrep_search(
     except FileNotFoundError:
         return "Error: 'rg' (ripgrep) executable not found in PATH."
     except subprocess.TimeoutExpired:
-        return f"Error: ripgrep search for '{pattern}' timed out."
+        return f"Error: ripgrep search for '{resolved}' timed out."
     except Exception as e:
         return f"Error executing ripgrep: {e}"
 
 
 @tool
 def read_project_file(
-    file_path: str,
+    file_path: Optional[str] = None,
+    path: Optional[str] = None,
+    filename: Optional[str] = None,
+    filepath: Optional[str] = None,
     start_line: Optional[int] = None,
-    end_line: Optional[int] = None
+    end_line: Optional[int] = None,
+    **kwargs: Any
 ) -> str:
     """Read contents of a file in the project (such as CMakeLists.txt, configuration files, headers, or sources).
     Line numbers are 1-indexed.
+
+    Args:
+      file_path: Relative path to the file to inspect (e.g. 'src/engine/worker.cpp'). Also accepts 'path' or 'filename'.
+      start_line: Optional starting line number (1-indexed).
+      end_line: Optional ending line number (1-indexed).
     """
     global _ACTIVE_PROJECT_DIR
 
-    target = (_ACTIVE_PROJECT_DIR / file_path).resolve()
+    resolved = file_path or path or filename or filepath or kwargs.get("file") or kwargs.get("file_name") or ""
+    if not resolved:
+        return "Error: 'file_path' argument is required. Please specify the relative file path to read (e.g. read_project_file(file_path='src/main.cpp'))."
+
+    target = (_ACTIVE_PROJECT_DIR / resolved).resolve()
     if not str(target).startswith(str(_ACTIVE_PROJECT_DIR)):
-        return f"Error: Access denied. Cannot read outside project directory: {file_path}"
+        return f"Error: Access denied. Cannot read outside project directory: {resolved}"
 
     if not target.exists():
-        return f"Error: File '{file_path}' does not exist."
+        return f"Error: File '{resolved}' does not exist."
     if target.is_dir():
-        return f"Error: '{file_path}' is a directory, not a file."
+        return f"Error: '{resolved}' is a directory, not a file."
 
     try:
         with open(target, "r", encoding="utf-8", errors="replace") as f:
@@ -221,9 +249,13 @@ def read_project_file(
 
         selected = lines[start - 1:end]
         formatted = "".join(f"{i:4d} | {line}" for i, line in enumerate(selected, start=start))
-        return f"File: {file_path} (Lines {start}-{end} of {total_lines})\n\n{formatted}"
+        return (
+            f"File: {resolved} (Lines {start}-{end} of {total_lines})\n\n{formatted}\n\n"
+            f"[ACTION REQUIRED: You have inspected '{resolved}'. Immediately invoke 'append_documentation_section' "
+            f"to document this component's functional role, classes, inner algorithms, and concurrency before exploring any other files.]"
+        )
     except Exception as e:
-        return f"Error reading file '{file_path}': {e}"
+        return f"Error reading file '{resolved}': {e}"
 
 
 def extract_text(content: Any) -> str:
