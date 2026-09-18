@@ -5,6 +5,7 @@ Integrates clangd-query, ripgrep (rg), bounded file readers, and LLM factories.
 
 import os
 import sys
+import re
 import json
 import time
 import shutil
@@ -469,6 +470,98 @@ def list_project_structure(max_files_per_dir: int = 15) -> str:
     return "\n".join(lines)
 
 
+def parse_interface_methods(interface_text: str, default_class: str = "") -> List[Dict[str, Any]]:
+    """
+    Parse method signatures and names from clangd-query interface output.
+    Distinguishes trivial methods (= default, = delete, = 0) from non-trivial methods
+    that require body inspection via 'clangd_query show'.
+    """
+    results = []
+    lines = interface_text.splitlines()
+    in_interface = False
+    class_name = default_class
+
+    class_header_pattern = re.compile(r'(?:class|struct)\s+(?:[A-Za-z0-9_]+::)*([A-Za-z0-9_]+)')
+    func_pattern = re.compile(r'(?:(~[A-Za-z0-9_]+)|([A-Za-z0-9_]+)|(operator\s*[^\(\s]+))\s*\(')
+    control_keywords = {'if', 'for', 'while', 'switch', 'catch'}
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not class_name:
+            cm = class_header_pattern.search(stripped)
+            if cm:
+                class_name = cm.group(1)
+
+        if "Public Interface:" in stripped:
+            in_interface = True
+            continue
+        if not in_interface:
+            continue
+
+        if (stripped.startswith("//") or stripped.startswith("/*") or
+            stripped.startswith("*") or stripped.startswith("Critical") or
+            stripped.startswith("Minor") or stripped.startswith("Non-copyable") or
+            stripped.startswith("Note:") or stripped.startswith("#")):
+            continue
+
+        matches = list(func_pattern.finditer(stripped))
+        if matches:
+            last_match = matches[-1]
+            func_name = (last_match.group(1) or last_match.group(2) or last_match.group(3) or "").strip()
+            if not func_name or func_name in control_keywords:
+                continue
+
+            is_trivial = bool(re.search(r'=\s*(?:default|delete|0)\s*;?$', stripped))
+            full_sym = f"{class_name}::{func_name}" if class_name else func_name
+            results.append({
+                "class_name": class_name,
+                "method_name": func_name,
+                "full_symbol": full_sym,
+                "is_trivial": is_trivial,
+                "signature": stripped
+            })
+
+    return results
+
+
+def discover_module_functions(project_dir: Path, files: List[str]) -> List[str]:
+    """Statically discover function definitions across given files in a module."""
+    control_keywords = {'if', 'for', 'while', 'switch', 'catch', 'sizeof', 'decltype', 'return'}
+    pattern = re.compile(
+        r'^\s*(?:[A-Za-z0-9_<>:,\s\*&]+?\s+)?([A-Za-z0-9_]+::[~A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\([^;{}]*\)\s*(?:const)?\s*(?:noexcept)?\s*\{',
+        re.MULTILINE
+    )
+    funcs = set()
+    for rel_path in files:
+        full_path = project_dir / rel_path
+        if not full_path.exists() or full_path.is_dir():
+            continue
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="ignore")
+            for m in pattern.finditer(content):
+                name = m.group(1).strip()
+                if name not in control_keywords and not name.startswith("std::"):
+                    funcs.add(name)
+        except Exception:
+            pass
+    return sorted(list(funcs))
+
+
+def extract_touched_files(text: str, project_files: List[str]) -> List[str]:
+    """Extract which project files were referenced or displayed in tool output."""
+    touched = set()
+    for pf in project_files:
+        if pf in text:
+            touched.add(pf)
+        else:
+            base = Path(pf).name
+            if len(base) > 4 and re.search(r'\b' + re.escape(base) + r'\b', text):
+                touched.add(pf)
+    return sorted(list(touched))
+
+
 COMMON_CPP_TOOLS = [clangd_query, ripgrep_search, read_project_file, list_project_structure]
 
 __all__ = [
@@ -485,4 +578,7 @@ __all__ = [
     "extract_message_text",
     "discover_project_classes",
     "group_classes_by_module",
+    "parse_interface_methods",
+    "discover_module_functions",
+    "extract_touched_files",
 ]

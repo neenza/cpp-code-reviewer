@@ -31,7 +31,6 @@ from langgraph.prebuilt import ToolNode, tools_condition
 load_dotenv()
 console = Console()
 
-# Common C++ Analysis Tools and Utilities
 from cpp_agent_tools import (
     clangd_query,
     ripgrep_search,
@@ -44,6 +43,9 @@ from cpp_agent_tools import (
     extract_message_text,
     discover_project_classes,
     group_classes_by_module,
+    parse_interface_methods,
+    discover_module_functions,
+    extract_touched_files,
     COMMON_CPP_TOOLS
 )
 
@@ -184,6 +186,15 @@ class ModuleReviewState(TypedDict):
     messages: Annotated[List[BaseMessage], message_reducer]
     module_name: str
     user_prompt: str
+    target_files: List[str]
+    target_classes: List[str]
+    interfaced_classes: List[str]
+    discovered_functions: List[str]
+    audited_functions: List[str]
+    audited_files: List[str]
+    nudge_count: int
+    findings_at_start: int
+    max_nudges: int
 
 
 _RECORDED_FINDINGS: List[Dict[str, Any]] = []
@@ -408,6 +419,226 @@ def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
     }
 
 
+def audit_tools_node(state: ModuleReviewState) -> Dict[str, Any]:
+    """
+    Execute tool calls emitted by the agent and deterministically update the Python audit ledger:
+    - On clangd_query(command='interface'): register discovered class methods and mark class interfaced.
+    - On clangd_query(command='show'): mark method and touched files as audited.
+    - On read_project_file: mark file and any functions defined in it as audited.
+    - On record_finding: record finding.
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+
+    last_msg = messages[-1]
+    if not isinstance(last_msg, AIMessage) or not getattr(last_msg, "tool_calls", None):
+        return {}
+
+    tool_map = {t.name: t for t in MODULE_AUDIT_TOOLS}
+    tool_messages = []
+
+    new_interfaced = set()
+    new_discovered_funcs = set()
+    new_audited_funcs = set()
+    new_audited_files = set()
+
+    target_files = state.get("target_files", [])
+
+    for tc in last_msg.tool_calls:
+        t_name = tc.get("name", "")
+        t_args = tc.get("args", {})
+        t_id = tc.get("id", f"call_{time.time()}")
+
+        tool_obj = tool_map.get(t_name)
+        if tool_obj:
+            try:
+                raw_res = tool_obj.invoke(t_args)
+            except Exception as e:
+                raw_res = f"Error executing tool '{t_name}': {e}"
+        else:
+            raw_res = f"Error: Tool '{t_name}' not recognized."
+
+        res_str = str(raw_res)
+        tool_messages.append(ToolMessage(content=res_str, tool_call_id=t_id, name=t_name))
+
+        # Check touched files in output
+        touched = extract_touched_files(res_str, target_files)
+        new_audited_files.update(touched)
+
+        if t_name == "clangd_query":
+            cmd = t_args.get("command", "show")
+            sym = t_args.get("symbol_or_query") or t_args.get("symbol") or t_args.get("query") or ""
+            if cmd == "interface":
+                if sym:
+                    clean_sym = sym.split("::")[-1]
+                    new_interfaced.add(sym)
+                    new_interfaced.add(clean_sym)
+                parsed_methods = parse_interface_methods(res_str, default_class=sym)
+                for item in parsed_methods:
+                    new_discovered_funcs.add(item["full_symbol"])
+                    if item["is_trivial"]:
+                        new_audited_funcs.add(item["full_symbol"])
+                        new_audited_funcs.add(item["method_name"])
+            elif cmd == "show":
+                if sym:
+                    new_audited_funcs.add(sym)
+                    short_sym = sym.split("::")[-1]
+                    new_audited_funcs.add(short_sym)
+                    for df in state.get("discovered_functions", []):
+                        if df == sym or df.endswith("::" + short_sym) or df == short_sym:
+                            new_audited_funcs.add(df)
+            elif cmd == "usages":
+                pass
+        elif t_name == "read_project_file":
+            fp = t_args.get("file_path") or t_args.get("path") or t_args.get("filename") or ""
+            if fp:
+                new_audited_files.add(fp)
+                for df in state.get("discovered_functions", []):
+                    if fp in df or Path(fp).stem in df:
+                        new_audited_funcs.add(df)
+
+    updated_interfaced = sorted(list(set(state.get("interfaced_classes", [])).union(new_interfaced)))
+    updated_discovered = sorted(list(set(state.get("discovered_functions", [])).union(new_discovered_funcs)))
+    updated_audited = sorted(list(set(state.get("audited_functions", [])).union(new_audited_funcs)))
+    updated_files = sorted(list(set(state.get("audited_files", [])).union(new_audited_files)))
+
+    return {
+        "messages": tool_messages,
+        "interfaced_classes": updated_interfaced,
+        "discovered_functions": updated_discovered,
+        "audited_functions": updated_audited,
+        "audited_files": updated_files
+    }
+
+
+def route_module_reviewer(state: ModuleReviewState) -> str:
+    """
+    Conditional edge router for module reviewer:
+    1. If the agent emitted tool calls -> route to 'tools'.
+    2. If the agent emitted no tool calls -> Python checks the audit ledger.
+       If any classes, functions, or files in this module remain unaudited,
+       keep the agent in the module by routing to 'enforce_audit'.
+    3. Once all required code elements have been inspected (or safety nudge limit reached),
+       allow route to END.
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return END
+
+    last_msg = messages[-1]
+    if getattr(last_msg, "tool_calls", None):
+        return "tools"
+
+    # Agent emitted no tool calls! Check if audit is truly complete on Python side
+    target_classes = state.get("target_classes", [])
+    interfaced_classes = set(state.get("interfaced_classes", []))
+    remaining_classes = [c for c in target_classes if c not in interfaced_classes]
+
+    audited_funcs = set(state.get("audited_functions", []))
+    discovered_funcs = state.get("discovered_functions", [])
+    remaining_funcs = [
+        f for f in discovered_funcs
+        if f not in audited_funcs and f.split("::")[-1] not in audited_funcs
+    ]
+
+    target_files = state.get("target_files", [])
+    audited_files = set(state.get("audited_files", []))
+    remaining_files = [f for f in target_files if f not in audited_files]
+
+    nudge_count = state.get("nudge_count", 0)
+    max_nudges = state.get("max_nudges", 15)
+
+    is_incomplete = bool(remaining_classes or remaining_funcs or remaining_files)
+
+    if is_incomplete and nudge_count < max_nudges:
+        return "enforce_audit"
+
+    return END
+
+
+def enforce_audit_node(state: ModuleReviewState) -> Dict[str, Any]:
+    """
+    Node invoked when the agent tries to exit the module prematurely.
+    Informs the model of what classes, member functions, and files remain unaudited,
+    and injects an imperative directive forcing it to continue auditing.
+    """
+    module_name = state.get("module_name", "")
+    nudge_count = state.get("nudge_count", 0) + 1
+
+    target_classes = state.get("target_classes", [])
+    interfaced_classes = set(state.get("interfaced_classes", []))
+    remaining_classes = [c for c in target_classes if c not in interfaced_classes]
+
+    audited_funcs = set(state.get("audited_functions", []))
+    discovered_funcs = state.get("discovered_functions", [])
+    remaining_funcs = [
+        f for f in discovered_funcs
+        if f not in audited_funcs and f.split("::")[-1] not in audited_funcs
+    ]
+
+    target_files = state.get("target_files", [])
+    audited_files = set(state.get("audited_files", []))
+    remaining_files = [f for f in target_files if f not in audited_files]
+
+    total_funcs = len(discovered_funcs)
+    audited_funcs_count = total_funcs - len(remaining_funcs)
+    total_files = len(target_files)
+    audited_files_count = total_files - len(remaining_files)
+
+    global _RECORDED_FINDINGS
+    findings_count = len(_RECORDED_FINDINGS)
+
+    console.print(
+        f"\n  [bold yellow][Audit Incomplete - Nudge {nudge_count}]: Keeping agent in module '{escape(module_name)}'.[/bold yellow]\n"
+        f"    Progress: {audited_funcs_count}/{total_funcs} functions audited | {audited_files_count}/{total_files} files touched | "
+        f"{findings_count} total findings recorded"
+    )
+    if remaining_classes:
+        console.print(f"    [yellow]Pending class interfaces ({len(remaining_classes)}):[/yellow] {', '.join(remaining_classes[:6])}")
+    if remaining_funcs:
+        console.print(f"    [yellow]Pending function implementations ({len(remaining_funcs)}):[/yellow] {', '.join(remaining_funcs[:8])}...")
+    if remaining_files:
+        console.print(f"    [yellow]Pending uninspected files ({len(remaining_files)}):[/yellow] {', '.join(remaining_files[:6])}")
+
+    feedback_lines = [
+        f"AUDIT INCOMPLETE FOR MODULE '{module_name}'. You cannot conclude or move to the next module yet.",
+        f"Audit Progress: {audited_funcs_count}/{total_funcs} functions read, {audited_files_count}/{total_files} files inspected, {findings_count} findings recorded.",
+        "\nThe following required code elements in this module have NOT yet been audited:"
+    ]
+    if remaining_classes:
+        feedback_lines.append(
+            f"- Classes needing interface review ({len(remaining_classes)} remaining): {', '.join(remaining_classes[:6])}\n"
+            f"  ACTION REQUIRED: Call clangd_query(command='interface', symbol_or_query='{remaining_classes[0]}') to inspect class layouts."
+        )
+    if remaining_funcs:
+        top_funcs = remaining_funcs[:15]
+        feedback_lines.append(
+            f"- Member/free functions not yet inspected via 'clangd_query(command=\"show\")' ({len(remaining_funcs)} remaining): "
+            f"{', '.join(top_funcs)}"
+        )
+        feedback_lines.append(
+            f"  ACTION REQUIRED: Call clangd_query(command='show', symbol_or_query='{top_funcs[0]}') to inspect its implementation code."
+        )
+    if remaining_files:
+        feedback_lines.append(
+            f"- Uninspected files in module ({len(remaining_files)} remaining): {', '.join(remaining_files[:10])}\n"
+            f"  ACTION REQUIRED: Inspect these files using clangd_query for symbols or read_project_file (if <80 lines)."
+        )
+    feedback_lines.append(
+        "\nIMPORTANT: If you discover any architectural decisions, exceptional patterns, minor improvements, "
+        "or critical flaws (memory leaks, buffer overflows, missing locks, raw pointers), call 'record_finding' immediately.\n"
+        "Continue auditing the pending items now."
+    )
+
+    nudge_msg = HumanMessage(content="\n".join(feedback_lines))
+    return {
+        "messages": [nudge_msg],
+        "nudge_count": nudge_count,
+        "max_nudges": state.get("max_nudges", 15)
+    }
+
+
 def build_module_reviewer(
     llm,
     max_context_tokens: int = 32000,
@@ -415,7 +646,7 @@ def build_module_reviewer(
 ):
     """
     Build a focused ReAct reviewer for auditing a single directory module,
-    strictly bounded by proactive token summarization and context monitoring.
+    strictly bounded by proactive token summarization and Python-side audit enforcement.
     """
     llm_with_tools = llm.bind_tools(MODULE_AUDIT_TOOLS)
 
@@ -467,25 +698,30 @@ def build_module_reviewer(
             return {"messages": ("override", trimmed_messages + [response])}
         return {"messages": [response]}
 
-    tool_node = ToolNode(MODULE_AUDIT_TOOLS)
     wf = StateGraph(ModuleReviewState)
     wf.add_node("agent", agent_step)
-    wf.add_node("tools", tool_node)
+    wf.add_node("tools", audit_tools_node)
+    wf.add_node("enforce_audit", enforce_audit_node)
     wf.add_edge(START, "agent")
-    wf.add_conditional_edges("agent", tools_condition, ["tools", END])
+    wf.add_conditional_edges("agent", route_module_reviewer, {
+        "tools": "tools",
+        "enforce_audit": "enforce_audit",
+        END: END
+    })
     wf.add_edge("tools", "agent")
+    wf.add_edge("enforce_audit", "agent")
     return wf.compile()
 
 
 def review_module_node_factory(
     llm,
-    module_max_steps: int = 40,
+    module_max_steps: int = 300,
     max_context_tokens: int = 32000,
     summarize_threshold: Optional[int] = None
 ):
     """
     Factory creating the review_module_node with configurable step limit, context management,
-    and priority semantic code inspection.
+    and deterministic Python-side audit ledger enforcement.
     """
     sub_agent = build_module_reviewer(
         llm,
@@ -505,6 +741,11 @@ def review_module_node_factory(
         mod_classes = state.get("module_classes_map", {}).get(current_module, [])
         classes_str = ", ".join(f"`{c}`" for c in mod_classes) if mod_classes else "None directly declared (audit member/free functions)"
 
+        proj_path = get_active_project_dir()
+        initial_module_funcs = discover_module_functions(proj_path, files)
+        if initial_module_funcs:
+            console.print(f"  [dim]Discovered {len(initial_module_funcs)} defined functions in module files: {', '.join(initial_module_funcs[:5])}...[/dim]")
+
         user_prompt_section = ""
         user_prompt = state.get("user_prompt", "")
         if user_prompt:
@@ -518,7 +759,7 @@ def review_module_node_factory(
 
         prompt = (
             f"You are conducting a strict modern C++ code review for module directory: '{current_module}'\n"
-            f"Files in this module:\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
+            f"Files in this module ({len(files)} files):\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
             f"Known Classes & Structs in this module (discovered via 'rg class/struct'):\n{classes_str}\n\n"
             f"{user_prompt_section}"
             f"MANDATORY CODE INSPECTION & REVIEW PROTOCOL:\n"
@@ -526,7 +767,7 @@ def review_module_node_factory(
             f"Only use 'read_project_file' for small files (< 80 lines) or build configs (CMakeLists.txt).\n"
             f"2. SEMANTIC CLASS INSPECTION: For each class/struct in this module:\n"
             f"   - Run 'clangd_query' with command='interface' and symbol_or_query='<ClassName>' to inspect its layout, member variables, and method signatures.\n"
-            f"   - Run 'clangd_query' with command='show' and symbol_or_query='<ClassName::MethodName>' to inspect member function bodies and inner logic.\n"
+            f"   - For every non-trivial method discovered in the interface, run 'clangd_query' with command='show' and symbol_or_query='<ClassName::MethodName>' to inspect its implementation code.\n"
             f"3. FUNCTION AUDIT: For all standalone functions, inspect their source code with 'clangd_query(command=\"show\", symbol_or_query=\"<FunctionName>\")'.\n"
             f"   Ensure ALL symbols, classes, and member functions in this module are read and reviewed at least once!\n"
             f"4. USAGES & REFERENCES: Run 'clangd_query' with command='usages' to check where key classes and functions are called, verifying ownership and call-site safety.\n"
@@ -534,7 +775,7 @@ def review_module_node_factory(
             f"   - Raw pointers, manual memory management (malloc, free, new, delete, reinterpret_cast, strcpy, sprintf).\n"
             f"   - Synchronization primitives (mutex, shared_mutex, lock_guard, unique_lock, atomic, condition_variable).\n"
             f"6. RECORD FINDINGS: Call 'record_finding' immediately whenever you detect an architectural insight, exceptional code pattern, minor improvement, or critical flaw.\n"
-            f"7. CONCLUDE: Finish when all symbols and files in '{current_module}' have been reviewed."
+            f"7. AUDIT ENFORCEMENT: Python tracks all audited classes, methods, and files. You cannot conclude or proceed to the next module until all code in this module has been read and audited."
         )
 
         sub_state: ModuleReviewState = {
@@ -549,9 +790,19 @@ def review_module_node_factory(
                 HumanMessage(content=prompt)
             ],
             "module_name": current_module,
-            "user_prompt": user_prompt
+            "user_prompt": user_prompt,
+            "target_files": sorted(files),
+            "target_classes": sorted(mod_classes),
+            "interfaced_classes": [],
+            "discovered_functions": sorted(initial_module_funcs),
+            "audited_functions": [],
+            "audited_files": [],
+            "nudge_count": 0,
+            "findings_at_start": len(_RECORDED_FINDINGS),
+            "max_nudges": 15
         }
 
+        findings_before = len(_RECORDED_FINDINGS)
         try:
             for step in sub_agent.stream(sub_state, {"recursion_limit": module_max_steps}, stream_mode="updates"):
                 for node_name, node_update in step.items():
@@ -559,19 +810,22 @@ def review_module_node_factory(
                         # Token context banner and tool calls are displayed in agent_step
                         pass
                     elif node_name == "tools":
-                        for msg in node_update["messages"]:
+                        for msg in node_update.get("messages", []):
                             raw_text = extract_text(msg.content)
                             t_tokens = count_tokens(raw_text)
                             preview = raw_text[:120].replace("\n", " ")
                             if len(raw_text) > 120:
                                 preview += "..."
                             console.print(f"    [dim]Tool Result ({t_tokens:,} tokens): {escape(preview)}[/dim]")
+                    elif node_name == "enforce_audit":
+                        pass
         except Exception as e:
             # If a single module hits its local recursion limit, log and proceed to the next module
             console.print(f"[dim yellow]  (Module '{escape(current_module)}' completed exploration; proceeding to next module: {e})[/dim yellow]")
 
         pct = ((idx + 1) / len(modules)) * 100
-        console.print(f"[green][OK] Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
+        new_findings = len(_RECORDED_FINDINGS) - findings_before
+        console.print(f"[green][OK] Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete) [{new_findings} findings recorded in this module][/green]")
 
         return {
             "current_module_index": idx + 1,

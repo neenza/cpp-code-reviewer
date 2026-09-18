@@ -292,9 +292,216 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
         self.assertIn("main.cpp which orchestrates the order processing loop", content)
 
         if tmp_path.exists():
-
             tmp_path.unlink()
+
+    def test_parse_interface_methods(self):
+        from cpp_agent_tools import parse_interface_methods
+        interface_sample = """
+class order_system::OrderRepository - include/order_repository.h:17:7
+
+Public Interface:
+
+OrderRepository() = default
+
+~OrderRepository() = default
+
+OrderRepository(const OrderRepository&) = delete
+  Non-copyable, movable
+
+OrderRepository& operator=(const OrderRepository&) = delete
+
+bool add_order(const Order& order)
+
+std::optional<Order> get_order(const std::string& order_id) const
+
+size_t count() const noexcept
+"""
+        parsed = parse_interface_methods(interface_sample)
+        self.assertGreater(len(parsed), 0)
+
+        # Check trivial methods
+        trivial_syms = [p["full_symbol"] for p in parsed if p["is_trivial"]]
+        self.assertTrue(any("OrderRepository" in s for s in trivial_syms))
+        self.assertTrue(any("operator=" in s for s in trivial_syms))
+
+        # Check non-trivial methods
+        non_trivial = [p["full_symbol"] for p in parsed if not p["is_trivial"]]
+        self.assertIn("OrderRepository::add_order", non_trivial)
+        self.assertIn("OrderRepository::get_order", non_trivial)
+        self.assertIn("OrderRepository::count", non_trivial)
+
+    def test_discover_module_functions(self):
+        from cpp_agent_tools import discover_module_functions
+        src_files = ["src/order_repository.cpp", "src/session_manager.cpp"]
+        funcs = discover_module_functions(self.sample_dir, src_files)
+        self.assertIn("OrderRepository::add_order", funcs)
+        self.assertIn("SessionManager::create_session", funcs)
+        self.assertIn("SessionManager::cleanup_all", funcs)
+
+    def test_extract_touched_files(self):
+        from cpp_agent_tools import extract_touched_files
+        sample_output = """
+Found method 'order_system::OrderRepository::add_order'
+From include/order_repository.h:28:10 (declaration)
+From src/order_repository.cpp:6:23 (definition)
+"""
+        project_files = ["include/order_repository.h", "src/order_repository.cpp", "src/main.cpp"]
+        touched = extract_touched_files(sample_output, project_files)
+        self.assertIn("include/order_repository.h", touched)
+        self.assertIn("src/order_repository.cpp", touched)
+        self.assertNotIn("src/main.cpp", touched)
+
+    def test_route_module_reviewer_enforces_pending_audit(self):
+        from code_review_agent import route_module_reviewer, enforce_audit_node
+        # State where agent emitted NO tool calls, but functions remain unaudited
+        state = {
+            "messages": [AIMessage(content="I have reviewed the interface. Finished.")],
+            "module_name": "src",
+            "user_prompt": "",
+            "target_files": ["src/session_manager.cpp"],
+            "target_classes": ["SessionManager"],
+            "interfaced_classes": ["SessionManager"],
+            "discovered_functions": ["SessionManager::create_session", "SessionManager::cleanup_all"],
+            "audited_functions": [],  # 0 audited
+            "audited_files": [],
+            "nudge_count": 0,
+            "findings_at_start": 0
+        }
+        route = route_module_reviewer(state)
+        self.assertEqual(route, "enforce_audit")
+
+        # Now test enforce_audit_node generates feedback and increments nudge_count
+        enforce_update = enforce_audit_node(state)
+        self.assertEqual(enforce_update["nudge_count"], 1)
+        feedback_content = enforce_update["messages"][0].content
+        self.assertIn("AUDIT INCOMPLETE FOR MODULE 'src'", feedback_content)
+        self.assertIn("SessionManager::create_session", feedback_content)
+
+    def test_route_module_reviewer_allows_completion_when_all_audited(self):
+        from code_review_agent import route_module_reviewer
+        from langgraph.graph import END
+        state = {
+            "messages": [AIMessage(content="Everything audited.")],
+            "module_name": "src",
+            "user_prompt": "",
+            "target_files": ["src/session_manager.cpp"],
+            "target_classes": ["SessionManager"],
+            "interfaced_classes": ["SessionManager"],
+            "discovered_functions": ["SessionManager::create_session"],
+            "audited_functions": ["SessionManager::create_session"],
+            "audited_files": ["src/session_manager.cpp"],
+            "nudge_count": 0,
+            "findings_at_start": 0
+        }
+        route = route_module_reviewer(state)
+        self.assertEqual(route, END)
+
+    def test_audit_tools_node_updates_ledger(self):
+        from code_review_agent import audit_tools_node
+        state = {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "clangd_query",
+                        "args": {"command": "interface", "symbol_or_query": "OrderRepository"},
+                        "id": "tc_1"
+                    }]
+                )
+            ],
+            "module_name": "include",
+            "user_prompt": "",
+            "target_files": ["include/order_repository.h"],
+            "target_classes": ["OrderRepository"],
+            "interfaced_classes": [],
+            "discovered_functions": [],
+            "audited_functions": [],
+            "audited_files": [],
+            "nudge_count": 0,
+            "findings_at_start": 0
+        }
+        res = audit_tools_node(state)
+        self.assertIn("OrderRepository", res["interfaced_classes"])
+        self.assertTrue(any("OrderRepository::add_order" in f for f in res["discovered_functions"]))
+        self.assertTrue(any("OrderRepository::count" in f for f in res["discovered_functions"]))
+        self.assertIn("include/order_repository.h", res["audited_files"])
+
+    def test_end_to_end_module_reviewer_flow_with_audit_enforcement(self):
+        from code_review_agent import build_module_reviewer
+
+        class ScriptedLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, messages):
+                self.calls += 1
+                # Turn 1: Query interface
+                if self.calls == 1:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[{
+                            "name": "clangd_query",
+                            "args": {"command": "interface", "symbol_or_query": "SessionManager"},
+                            "id": "tc_interface"
+                        }]
+                    )
+                # Turn 2: Attempt premature conclusion without tool calls
+                elif self.calls == 2:
+                    return AIMessage(content="Interface reviewed. Moving on.")
+                # Turn 3: Received enforce_audit nudge! Inspect create_session & record finding
+                elif self.calls == 3:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "clangd_query",
+                                "args": {"command": "show", "symbol_or_query": "SessionManager::create_session"},
+                                "id": "tc_show"
+                            },
+                            {
+                                "name": "record_finding",
+                                "args": {
+                                    "category": "critical_flaw",
+                                    "title": "Buffer Overflow in SessionManager::create_session",
+                                    "details": "strcpy without bounds checking",
+                                    "files_and_lines": "src/session_manager.cpp:18"
+                                },
+                                "id": "tc_finding"
+                            }
+                        ]
+                    )
+                # Turn 4+: Mark remaining functions
+                else:
+                    return AIMessage(content="All code examined.")
+
+        app = build_module_reviewer(llm=ScriptedLLM(), max_context_tokens=32000)
+        initial_state = {
+            "messages": [HumanMessage(content="Audit module src")],
+            "module_name": "src",
+            "user_prompt": "",
+            "target_files": ["src/session_manager.cpp"],
+            "target_classes": ["SessionManager"],
+            "interfaced_classes": [],
+            "discovered_functions": [],
+            "audited_functions": [],
+            "audited_files": [],
+            "nudge_count": 0,
+            "findings_at_start": 0,
+            "max_nudges": 2
+        }
+        res = app.invoke(initial_state, {"recursion_limit": 30})
+        self.assertGreater(res["nudge_count"], 0)
+        self.assertIn("SessionManager", res["interfaced_classes"])
+        self.assertTrue(any("create_session" in f for f in res["audited_functions"]))
+        # Verify finding was recorded
+        global _RECORDED_FINDINGS
+        self.assertTrue(any("Buffer Overflow in SessionManager::create_session" in f["title"] for f in _RECORDED_FINDINGS))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+

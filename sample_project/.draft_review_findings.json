@@ -1,10 +1,18 @@
 [
   {
     "category": "critical_flaw",
+    "title": "Buffer Overflow in SessionManager::create_session",
+    "details": "strcpy without bounds checking",
+    "files_and_lines": "src/session_manager.cpp:18",
+    "recommended_fix": "",
+    "timestamp": 1789733488.969038
+  },
+  {
+    "category": "critical_flaw",
     "title": "Buffer overflow in SessionManager",
     "details": "strcpy without bounds check",
     "files_and_lines": "src/session_manager.cpp:18",
     "recommended_fix": "Use std::string or snprintf",
-    "timestamp": 1789729273.101397
+    "timestamp": 1789733489.1073637
   }
 ]
