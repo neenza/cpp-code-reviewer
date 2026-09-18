@@ -227,10 +227,19 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
             tmp_path = Path(tmp.name)
 
         init_documentation_file(tmp_path, "TestSeq")
-        # Pass out of sequence or prefixed titles
-        append_documentation_section.invoke({"section_title": "Section 9: Core Engine", "markdown_content": "Engine logic."})
-        append_documentation_section.invoke({"section_title": "3. Data Storage", "markdown_content": "Storage logic."})
-        append_documentation_section.invoke({"section_title": "Networking API", "markdown_content": "Network logic."})
+        # Pass out of sequence or prefixed titles with substantive markdown content (>30 chars)
+        append_documentation_section.invoke({
+            "section_title": "Section 9: Core Engine",
+            "markdown_content": "Detailed core engine architectural logic and processing workflow."
+        })
+        append_documentation_section.invoke({
+            "section_title": "3. Data Storage",
+            "markdown_content": "Thread-safe data storage repository mechanisms and indexing logic."
+        })
+        append_documentation_section.invoke({
+            "section_title": "Networking API",
+            "markdown_content": "Network protocol handling and asynchronous endpoint management."
+        })
 
         with open(tmp_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -244,11 +253,11 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
             tmp_path.unlink()
 
     def test_document_module_node_guaranteed_append(self):
-        from code_documenter_agent import document_module_node_factory, init_documentation_file, _DOCUMENTED_SECTIONS
+        import code_documenter_agent
         with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
-        init_documentation_file(tmp_path, "TestModuleAppend")
+        code_documenter_agent.init_documentation_file(tmp_path, "TestModuleAppend")
 
         # Dummy LLM that returns text without calling append_documentation_section tool
         class DirectTextLLM:
@@ -257,7 +266,7 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
             def invoke(self, messages):
                 return AIMessage(content="### Functional Explanation for src\nThe `src` module contains main.cpp which orchestrates the order processing loop and initializes repository storage.")
 
-        node_fn = document_module_node_factory(llm=DirectTextLLM(), max_context_tokens=32000, module_max_steps=5)
+        node_fn = code_documenter_agent.document_module_node_factory(llm=DirectTextLLM(), max_context_tokens=32000, module_max_steps=5)
         state = {
             "project_dir": str(self.sample_dir),
             "output_file": str(tmp_path),
@@ -273,7 +282,7 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
 
         res = node_fn(state)
         self.assertEqual(res["current_module_index"], 1)
-        self.assertGreater(len(_DOCUMENTED_SECTIONS), 0)
+        self.assertGreater(len(code_documenter_agent._DOCUMENTED_SECTIONS), 0)
 
         with open(tmp_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -283,6 +292,7 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
         self.assertIn("main.cpp which orchestrates the order processing loop", content)
 
         if tmp_path.exists():
+
             tmp_path.unlink()
 
 

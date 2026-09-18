@@ -41,8 +41,150 @@ from cpp_agent_tools import (
     ensure_compile_commands,
     get_llm,
     extract_text,
+    extract_message_text,
+    discover_project_classes,
+    group_classes_by_module,
     COMMON_CPP_TOOLS
 )
+
+try:
+    import tiktoken
+    _TOKENIZER = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TOKENIZER = None
+
+
+def count_tokens(text: str) -> int:
+    """Estimate or accurately count tokens in a text string."""
+    if not text:
+        return 0
+    if _TOKENIZER:
+        try:
+            return len(_TOKENIZER.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    # Fallback heuristic: roughly 4 characters per token
+    return max(1, len(text) // 4)
+
+
+def count_message_tokens(msg: BaseMessage) -> int:
+    """Calculate token size of a LangChain message including tool calls."""
+    tokens = count_tokens(extract_text(msg.content)) + 4
+    if isinstance(msg, AIMessage) and msg.tool_calls:
+        for tc in msg.tool_calls:
+            tokens += count_tokens(tc.get("name", ""))
+            tokens += count_tokens(json.dumps(tc.get("args", {}))) + 6
+    return tokens
+
+
+def partition_messages_safely(
+    messages: List[BaseMessage],
+    target_recent_count: int = 4
+) -> tuple:
+    """
+    Safely partition messages into older history (to summarize) and recent turns (to preserve intact),
+    guaranteeing that AIMessages with tool calls and their corresponding ToolMessages are never separated.
+    """
+    if len(messages) <= target_recent_count:
+        return [], messages
+
+    split_idx = len(messages) - target_recent_count
+
+    while split_idx < len(messages) and isinstance(messages[split_idx], ToolMessage):
+        split_idx += 1
+
+    while split_idx > 0 and isinstance(messages[split_idx - 1], AIMessage) and getattr(messages[split_idx - 1], "tool_calls", None):
+        split_idx -= 1
+
+    older = messages[:split_idx]
+    recent = messages[split_idx:]
+    return older, recent
+
+
+def print_context_banner(messages: List[BaseMessage], max_tokens: int, stage: str = "Step") -> int:
+    """Print current context size, percentage, and stage banner."""
+    total_tokens = sum(count_message_tokens(m) for m in messages)
+    pct = (total_tokens / max(1, max_tokens)) * 100
+    color = "green" if pct < 40 else ("yellow" if pct < 75 else "bold red")
+    console.print(f"  [{color}][Context: {total_tokens:,} / {max_tokens:,} tokens ({pct:.1f}%)] | {stage}[/{color}]")
+    return total_tokens
+
+
+def manage_context_with_summarization(
+    messages: List[BaseMessage],
+    max_tokens: int = 32000,
+    reserve_tokens: int = 2500,
+    summarize_threshold: Optional[int] = None
+) -> List[BaseMessage]:
+    """
+    Enforce strict context size limit with proactive rolling summarization for the review agent.
+    Never truncates active tool outputs to avoid information loss or code distortion.
+    When cumulative conversation tokens exceed the threshold, safely summarizes completed older turns
+    into a high-signal technical context summary while preserving recent active turns intact.
+    """
+    if summarize_threshold is None:
+        summarize_threshold = min(12000, int(max_tokens * 0.45))
+    effective_limit = min(summarize_threshold, max_tokens - reserve_tokens)
+
+    cur_tokens = sum(count_message_tokens(m) for m in messages)
+
+    if cur_tokens <= effective_limit or len(messages) <= 3:
+        return messages
+
+    # Context exceeds limit -> Perform Rolling Technical Summarization of older turns
+    console.print(
+        f"\n  [bold yellow][Notice] Context reached {cur_tokens:,} tokens (exceeding threshold {effective_limit:,}). "
+        f"Active Rolling Summarization initiated...[/bold yellow]"
+    )
+
+    preserved_header = messages[:2] if len(messages) > 2 else messages
+    conversation_tail = list(messages[2:]) if len(messages) > 2 else []
+
+    history_to_summarize, recent_active_turns = partition_messages_safely(conversation_tail, target_recent_count=2)
+    if not history_to_summarize:
+        return messages
+
+    extracted_facts = []
+    for m in history_to_summarize:
+        if isinstance(m, ToolMessage):
+            raw = extract_text(m.content).strip()
+            if raw:
+                preview = raw[:350].replace("\n", " ")
+                extracted_facts.append(f"- Tool `{m.name}` result: {preview}")
+        elif isinstance(m, AIMessage):
+            text = extract_message_text(m)
+            if text and len(text) > 30:
+                extracted_facts.append(f"- Review Exploration Note: {text[:250].replace(chr(10), ' ')}")
+
+    summary_text = (
+        "### Prior Code Review Steps Summary (Condensed to stay within strict context limit):\n"
+        + ("\n".join(extracted_facts[:15]) if extracted_facts else "Audited earlier classes and functions in current module.")
+    )
+
+    summary_message = SystemMessage(content=summary_text)
+    new_messages = preserved_header + [summary_message] + recent_active_turns
+    new_tokens = sum(count_message_tokens(m) for m in new_messages)
+    saved = cur_tokens - new_tokens
+    console.print(f"  [bold green][OK] Context condensed from {cur_tokens:,} down to {new_tokens:,} tokens (-{(saved/max(1, cur_tokens))*100:.1f}%, saved {saved:,} tokens).[/bold green]\n")
+    return new_messages
+
+
+def message_reducer(existing: List[BaseMessage], update: Any) -> List[BaseMessage]:
+    """Custom reducer supporting list concatenation and explicit context override upon summarization."""
+    if isinstance(update, tuple) and len(update) == 2 and update[0] == "override":
+        return list(update[1])
+    if isinstance(update, list):
+        return list(existing) + list(update)
+    if isinstance(update, BaseMessage):
+        return list(existing) + [update]
+    return list(existing)
+
+
+class ModuleReviewState(TypedDict):
+    messages: Annotated[List[BaseMessage], message_reducer]
+    module_name: str
+    user_prompt: str
+
 
 _RECORDED_FINDINGS: List[Dict[str, Any]] = []
 
@@ -100,7 +242,7 @@ def record_finding(
         "critical_flaw": "[red]CRITICAL FLAW[/red]"
     }.get(category, category.upper())
 
-    console.print(f"  [bold]📝 Recorded Finding ({cat_badge}):[/bold] {escape(title)} ({escape(files_and_lines)})")
+    console.print(f"  [bold][RECORDED FINDING] ({cat_badge}):[/bold] {escape(title)} ({escape(files_and_lines)})")
     return f"Successfully recorded finding [{category.upper()}]: '{title}'. Total findings recorded: {len(_RECORDED_FINDINGS)}"
 
 
@@ -113,12 +255,16 @@ MODULE_AUDIT_TOOLS = [clangd_query, ripgrep_search, read_project_file, record_fi
 
 class RepoReviewState(TypedDict):
     project_dir: str
+    user_prompt: str
     all_files: List[str]
     modules: List[str]
     module_files_map: Dict[str, List[str]]
+    module_classes_map: Dict[str, List[str]]
     current_module_index: int
     findings: Annotated[List[Dict[str, Any]], operator.add]
     final_report: str
+    max_context_tokens: int
+    summarize_threshold: int
 
 
 DEFAULT_IGNORED_DIRS = {
@@ -139,12 +285,16 @@ def is_ignored_path(rel_path: Path, custom_ignored: Optional[set] = None) -> boo
 
 def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
     """
-    Node 1: Discover active project source files and CMake structure,
+    Node 1: Discover active project source files, classes, and CMake structure,
     excluding third-party/vendor libraries not managed as core codebase.
     """
     proj_path = get_active_project_dir()
 
-    console.print("\n[bold cyan]═══ Phase 1: Repository Inventory & Module Planning ═══[/bold cyan]")
+    console.print("\n[bold cyan]═══ Phase 1: Repository Inventory, Class Discovery & Module Planning ═══[/bold cyan]")
+
+    user_prompt = state.get("user_prompt", "")
+    if user_prompt:
+        console.print(f"[cyan][User Review Directive]: {user_prompt}[/cyan]")
 
     # Check compile_commands.json for exact CMake compiled translation units
     cc_sources = set()
@@ -200,6 +350,11 @@ def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
 
     all_files = sorted(list(set(rel_headers + rel_sources)))
 
+    # Discover classes and structs across project files
+    file_to_classes = discover_project_classes(proj_path)
+    module_classes_map = group_classes_by_module(file_to_classes)
+    total_classes = sum(len(c) for c in module_classes_map.values())
+
     # Group files by parent directory (module)
     module_map: Dict[str, List[str]] = {}
     for f in all_files:
@@ -210,11 +365,15 @@ def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
 
     sorted_modules = sorted(list(module_map.keys()))
 
-    console.print(f"[green]Discovered {len(all_files)} primary project files across {len(sorted_modules)} core directories/modules:[/green]")
+    console.print(f"[green]Discovered {len(all_files)} primary project files across {len(sorted_modules)} core directories/modules.[/green]")
+    console.print(f"[green]Discovered {total_classes} declared classes/structs across repository (scanned via rg class/struct):[/green]")
+    for mod in sorted_modules:
+        m_classes = module_classes_map.get(mod, [])
+        cls_tag = f" — Classes: {', '.join(m_classes)}" if m_classes else ""
+        console.print(f"  - [bold]{escape(mod)}/[/bold] ({len(module_map[mod])} files){cls_tag}")
+
     if cc_sources:
         console.print(f"  [dim](Validated {len(cc_sources)} active compilation units from compile_commands.json)[/dim]")
-    for mod in sorted_modules:
-        console.print(f"  📁 [bold]{escape(mod)}/[/bold] ({len(module_map[mod])} files)")
 
     # Read CMakeLists.txt if present
     cmakelists_path = proj_path / "CMakeLists.txt"
@@ -240,25 +399,41 @@ def discover_and_plan_node(state: RepoReviewState) -> Dict[str, Any]:
         "all_files": all_files,
         "modules": sorted_modules,
         "module_files_map": module_map,
+        "module_classes_map": module_classes_map,
         "current_module_index": 0,
-        "findings": arch_findings
+        "findings": arch_findings,
+        "user_prompt": user_prompt,
+        "max_context_tokens": state.get("max_context_tokens", 32000),
+        "summarize_threshold": state.get("summarize_threshold", 12000)
     }
 
 
-def build_module_reviewer(llm):
+def build_module_reviewer(
+    llm,
+    max_context_tokens: int = 32000,
+    summarize_threshold: Optional[int] = None
+):
     """
-    Build a focused ReAct reviewer for auditing a single directory module.
+    Build a focused ReAct reviewer for auditing a single directory module,
+    strictly bounded by proactive token summarization and context monitoring.
     """
     llm_with_tools = llm.bind_tools(MODULE_AUDIT_TOOLS)
 
-    def agent_step(state: MessagesState) -> Dict[str, Any]:
-        messages = state["messages"]
+    def agent_step(state: ModuleReviewState) -> Dict[str, Any]:
+        trimmed_messages = manage_context_with_summarization(
+            state["messages"],
+            max_tokens=max_context_tokens,
+            summarize_threshold=summarize_threshold
+        )
+        print_context_banner(trimmed_messages, max_tokens=max_context_tokens, stage="Agent LLM Invocation")
+
         max_retries = 5
         base_delay = 6
+        response = None
         for attempt in range(1, max_retries + 1):
             try:
-                response = llm_with_tools.invoke(messages)
-                return {"messages": [response]}
+                response = llm_with_tools.invoke(trimmed_messages)
+                break
             except Exception as e:
                 err_msg = str(e)
                 if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
@@ -270,8 +445,30 @@ def build_module_reviewer(llm):
                 else:
                     raise e
 
+        # Calculate exact context size including the model's generated response
+        total_tokens = sum(count_message_tokens(m) for m in trimmed_messages) + count_message_tokens(response)
+        pct = (total_tokens / max(1, max_context_tokens)) * 100
+        color = "green" if pct < 40 else ("yellow" if pct < 75 else "bold red")
+
+        # Explicitly print context size before every tool call
+        if getattr(response, "tool_calls", None):
+            for tc in response.tool_calls:
+                console.print(
+                    f"  [{color}][Context: {total_tokens:,} / {max_context_tokens:,} tokens ({pct:.1f}%)][/{color}] "
+                    f"| [magenta]Tool Call:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})"
+                )
+        else:
+            txt = extract_message_text(response)
+            if txt:
+                console.print(f"  [dim]Agent: {escape(txt[:100])}...[/dim]")
+
+        # If summarization replaced/condensed earlier turns, use ("override", ...) to update state messages
+        if len(trimmed_messages) != len(state["messages"]):
+            return {"messages": ("override", trimmed_messages + [response])}
+        return {"messages": [response]}
+
     tool_node = ToolNode(MODULE_AUDIT_TOOLS)
-    wf = StateGraph(MessagesState)
+    wf = StateGraph(ModuleReviewState)
     wf.add_node("agent", agent_step)
     wf.add_node("tools", tool_node)
     wf.add_edge(START, "agent")
@@ -280,11 +477,21 @@ def build_module_reviewer(llm):
     return wf.compile()
 
 
-def review_module_node_factory(llm, module_max_steps: int = 40):
+def review_module_node_factory(
+    llm,
+    module_max_steps: int = 40,
+    max_context_tokens: int = 32000,
+    summarize_threshold: Optional[int] = None
+):
     """
-    Factory creating the review_module_node with configurable step limit and graceful recursion handling.
+    Factory creating the review_module_node with configurable step limit, context management,
+    and priority semantic code inspection.
     """
-    sub_agent = build_module_reviewer(llm)
+    sub_agent = build_module_reviewer(
+        llm,
+        max_context_tokens=max_context_tokens,
+        summarize_threshold=summarize_threshold
+    )
 
     def review_module_node(state: RepoReviewState) -> Dict[str, Any]:
         idx = state["current_module_index"]
@@ -294,44 +501,77 @@ def review_module_node_factory(llm, module_max_steps: int = 40):
 
         console.print(f"\n[bold yellow]═══ Phase 2: Auditing Module ({idx + 1}/{len(modules)}): [cyan]{escape(current_module)}/[/cyan] ({len(files)} files) ═══[/bold yellow]")
 
+        # Discovered classes for this module
+        mod_classes = state.get("module_classes_map", {}).get(current_module, [])
+        classes_str = ", ".join(f"`{c}`" for c in mod_classes) if mod_classes else "None directly declared (audit member/free functions)"
+
+        user_prompt_section = ""
+        user_prompt = state.get("user_prompt", "")
+        if user_prompt:
+            user_prompt_section = (
+                f"════════════════════════════════════════════════════════════════════════════════\n"
+                f"USER INITIAL REVIEW DIRECTIVE (HIGH PRIORITY FOCUS):\n"
+                f"{user_prompt}\n"
+                f"Ensure your audit specifically prioritizes and addresses the above directive.\n"
+                f"════════════════════════════════════════════════════════════════════════════════\n\n"
+            )
+
         prompt = (
-            f"You are conducting a strict C++ code review for module directory: '{current_module}'\n"
+            f"You are conducting a strict modern C++ code review for module directory: '{current_module}'\n"
             f"Files in this module:\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
-            f"INSTRUCTIONS:\n"
-            f"1. Use 'ripgrep_search' with path_filter='{current_module}' to audit for memory safety (malloc, free, new, delete, strcpy, sprintf, raw pointers) and concurrency (mutex, shared_mutex, atomic).\n"
-            f"2. Use 'clangd_query' ('show', 'interface', 'hierarchy') to inspect the classes and functions defined in these files.\n"
-            f"3. Call 'record_finding' for EVERY architectural detail, exceptional pattern, minor flaw, or critical vulnerability in this module.\n"
-            f"4. Conclude your module review when key classes and memory/concurrency checks have been audited."
+            f"Known Classes & Structs in this module (discovered via 'rg class/struct'):\n{classes_str}\n\n"
+            f"{user_prompt_section}"
+            f"MANDATORY CODE INSPECTION & REVIEW PROTOCOL:\n"
+            f"1. AVOID FULL-FILE READS: NEVER use 'read_project_file' on large files (> 80 lines). Full file reads cause context bloat! "
+            f"Only use 'read_project_file' for small files (< 80 lines) or build configs (CMakeLists.txt).\n"
+            f"2. SEMANTIC CLASS INSPECTION: For each class/struct in this module:\n"
+            f"   - Run 'clangd_query' with command='interface' and symbol_or_query='<ClassName>' to inspect its layout, member variables, and method signatures.\n"
+            f"   - Run 'clangd_query' with command='show' and symbol_or_query='<ClassName::MethodName>' to inspect member function bodies and inner logic.\n"
+            f"3. FUNCTION AUDIT: For all standalone functions, inspect their source code with 'clangd_query(command=\"show\", symbol_or_query=\"<FunctionName>\")'.\n"
+            f"   Ensure ALL symbols, classes, and member functions in this module are read and reviewed at least once!\n"
+            f"4. USAGES & REFERENCES: Run 'clangd_query' with command='usages' to check where key classes and functions are called, verifying ownership and call-site safety.\n"
+            f"5. MEMORY & CONCURRENCY CHECKS: Run 'ripgrep_search' with path_filter='{current_module}' to check for:\n"
+            f"   - Raw pointers, manual memory management (malloc, free, new, delete, reinterpret_cast, strcpy, sprintf).\n"
+            f"   - Synchronization primitives (mutex, shared_mutex, lock_guard, unique_lock, atomic, condition_variable).\n"
+            f"6. RECORD FINDINGS: Call 'record_finding' immediately whenever you detect an architectural insight, exceptional code pattern, minor improvement, or critical flaw.\n"
+            f"7. CONCLUDE: Finish when all symbols and files in '{current_module}' have been reviewed."
         )
 
-        sub_state: MessagesState = {
+        sub_state: ModuleReviewState = {
             "messages": [
-                SystemMessage(content="You are an expert modern C++ code auditor. Thoroughly examine the assigned module files. Call record_finding immediately for every discovery."),
+                SystemMessage(content=(
+                    "You are an expert modern C++ code auditor. Thoroughly examine the assigned module files. "
+                    "Prioritize semantic inspection: use 'clangd_query(command=\"interface\")' for class structures, "
+                    "'clangd_query(command=\"show\")' for function implementations, and 'clangd_query(command=\"usages\")' for references. "
+                    "NEVER read full large files with read_project_file. Ensure all symbols and functions are read at least once. "
+                    "Call record_finding immediately for every discovery."
+                )),
                 HumanMessage(content=prompt)
-            ]
+            ],
+            "module_name": current_module,
+            "user_prompt": user_prompt
         }
 
         try:
             for step in sub_agent.stream(sub_state, {"recursion_limit": module_max_steps}, stream_mode="updates"):
                 for node_name, node_update in step.items():
                     if node_name == "agent":
-                        msg = node_update["messages"][-1]
-                        if msg.tool_calls:
-                            for tc in msg.tool_calls:
-                                console.print(f"  [magenta]▶ Tool Call:[/magenta] [cyan]{escape(tc['name'])}[/cyan]({escape(json.dumps(tc['args']))})")
+                        # Token context banner and tool calls are displayed in agent_step
+                        pass
                     elif node_name == "tools":
                         for msg in node_update["messages"]:
                             raw_text = extract_text(msg.content)
+                            t_tokens = count_tokens(raw_text)
                             preview = raw_text[:120].replace("\n", " ")
                             if len(raw_text) > 120:
                                 preview += "..."
-                            console.print(f"[dim]    ↳ Tool Result: {escape(preview)}[/dim]")
+                            console.print(f"    [dim]Tool Result ({t_tokens:,} tokens): {escape(preview)}[/dim]")
         except Exception as e:
             # If a single module hits its local recursion limit, log and proceed to the next module
-            console.print(f"[dim yellow]  (Module '{escape(current_module)}' completed exploration; proceeding to next module)[/dim yellow]")
+            console.print(f"[dim yellow]  (Module '{escape(current_module)}' completed exploration; proceeding to next module: {e})[/dim yellow]")
 
         pct = ((idx + 1) / len(modules)) * 100
-        console.print(f"[green]✔ Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
+        console.print(f"[green][OK] Finished Module '{escape(current_module)}/' ({idx + 1}/{len(modules)} modules - {pct:.1f}% complete)[/green]")
 
         return {
             "current_module_index": idx + 1,
@@ -375,9 +615,13 @@ def synthesize_report_node(state: RepoReviewState) -> Dict[str, Any]:
     sections = [
         "# Comprehensive C++ Code Review Report",
         f"\n**Total Files Audited**: {len(state.get('all_files', []))} files across {len(state.get('modules', []))} directories/modules\n",
-        "## 1. Project Architecture & Dependency Overview"
     ]
 
+    user_prompt = state.get("user_prompt", "")
+    if user_prompt:
+        sections.append(f"## Initial Review Focus & Directive\n> {user_prompt}\n")
+
+    sections.append("## 1. Project Architecture & Dependency Overview")
     if arch:
         for item in arch:
             sections.append(f"### {item['title']}\n- **Location**: `{item['files_and_lines']}`\n\n{item['details']}\n")
@@ -403,7 +647,7 @@ def synthesize_report_node(state: RepoReviewState) -> Dict[str, Any]:
     sections.append("## 4. What Is Poorly Implemented or Contains Critical Flaws")
     if critical:
         for item in critical:
-            sections.append(f"### ⚠️ {item['title']}\n- **Location**: `{item['files_and_lines']}`\n\n{item['details']}")
+            sections.append(f"### [CRITICAL] {item['title']}\n- **Location**: `{item['files_and_lines']}`\n\n{item['details']}")
             if item.get("recommended_fix"):
                 sections.append(f"\n**Recommended Fix:**\n```cpp\n{item['recommended_fix']}\n```\n")
     else:
@@ -413,14 +657,24 @@ def synthesize_report_node(state: RepoReviewState) -> Dict[str, Any]:
     return {"final_report": final_report}
 
 
-def build_repo_review_orchestrator(llm, module_max_steps: int = 300):
+def build_repo_review_orchestrator(
+    llm,
+    module_max_steps: int = 300,
+    max_context_tokens: int = 32000,
+    summarize_threshold: Optional[int] = None
+):
     """
     Build the deterministic multi-node LangGraph orchestrator.
     """
     wf = StateGraph(RepoReviewState)
 
     wf.add_node("discover_and_plan", discover_and_plan_node)
-    wf.add_node("review_module", review_module_node_factory(llm, module_max_steps=module_max_steps))
+    wf.add_node("review_module", review_module_node_factory(
+        llm,
+        module_max_steps=module_max_steps,
+        max_context_tokens=max_context_tokens,
+        summarize_threshold=summarize_threshold
+    ))
     wf.add_node("synthesize_report", synthesize_report_node)
 
     wf.add_edge(START, "discover_and_plan")
@@ -444,7 +698,10 @@ def run_code_review(
     model_name: Optional[str] = None,
     ollama_host: str = "http://localhost:11434",
     output_report_path: Optional[str] = None,
-    max_steps: int = 300
+    max_steps: int = 300,
+    max_context_tokens: int = 32000,
+    summarize_threshold: Optional[int] = None,
+    user_prompt: str = ""
 ) -> str:
     """
     Execute the deterministic multi-node autonomous C++ review orchestrator.
@@ -464,32 +721,52 @@ def run_code_review(
         else:
             model_name = "gemini-3.5-flash-lite"
 
+    effective_summarize = summarize_threshold or min(12000, int(max_context_tokens * 0.45))
+    user_prompt_display = f"\nUser Directive: [yellow]{user_prompt}[/yellow]" if user_prompt else ""
+
     console.print(Panel(
         f"[bold cyan]Autonomous Modular C++ Code Review Orchestrator[/bold cyan]\n"
         f"Project Path : [yellow]{proj_path}[/yellow]\n"
         f"Provider     : [green]{provider}[/green]\n"
         f"Model        : [green]{model_name}[/green]\n"
+        f"Max Context  : [yellow]{max_context_tokens:,} tokens[/yellow]\n"
+        f"Summarize At : [yellow]{effective_summarize:,} tokens[/yellow]\n"
         f"Architecture : [blue]Deterministic Plan & Map-Reduce Multi-Node Graph[/blue]\n"
         f"Max Steps/Mod: [yellow]{max_steps}[/yellow]\n"
-        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, record_finding[/blue]",
+        f"Tools Active : [blue]clangd-query, ripgrep (rg), read_project_file, record_finding[/blue]"
+        f"{user_prompt_display}",
         title="Agent Configuration",
         border_style="cyan"
     ))
 
-    llm = get_llm(provider=provider, model_name=model_name, ollama_host=ollama_host)
-    app = build_repo_review_orchestrator(llm=llm, module_max_steps=max_steps)
+    llm = get_llm(
+        provider=provider,
+        model_name=model_name,
+        ollama_host=ollama_host,
+        max_context_tokens=max_context_tokens
+    )
+    app = build_repo_review_orchestrator(
+        llm=llm,
+        module_max_steps=max_steps,
+        max_context_tokens=max_context_tokens,
+        summarize_threshold=effective_summarize
+    )
 
     initial_state: RepoReviewState = {
         "project_dir": str(proj_path),
+        "user_prompt": user_prompt,
         "all_files": [],
         "modules": [],
         "module_files_map": {},
+        "module_classes_map": {},
         "current_module_index": 0,
         "findings": [],
-        "final_report": ""
+        "final_report": "",
+        "max_context_tokens": max_context_tokens,
+        "summarize_threshold": effective_summarize
     }
 
-    result = app.invoke(initial_state, {"recursion_limit": max_steps})
+    result = app.invoke(initial_state, {"recursion_limit": max_steps * 5})
     final_report = result.get("final_report", "")
 
     # Print markdown report
@@ -558,6 +835,25 @@ def parse_args():
         default=500,
         help="Maximum LangGraph execution recursion steps (default: 500)"
     )
+    parser.add_argument(
+        "--user-prompt", "--initial-prompt", "-u",
+        dest="user_prompt",
+        type=str,
+        default="",
+        help="Initial user prompt or specific review focus directive to guide the review agent."
+    )
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=32000,
+        help="Maximum context token limit to enforce (default: 32000 / 32k)"
+    )
+    parser.add_argument(
+        "--context-summarize-threshold",
+        type=int,
+        default=12000,
+        help="Context token threshold to proactively trigger rolling summarization (default: 12000 tokens)"
+    )
     return parser.parse_args()
 
 
@@ -574,5 +870,9 @@ if __name__ == "__main__":
         model_name=args.model,
         ollama_host=args.ollama_host,
         output_report_path=args.output,
-        max_steps=args.max_steps
+        max_steps=args.max_steps,
+        max_context_tokens=args.max_context_tokens,
+        summarize_threshold=args.context_summarize_threshold,
+        user_prompt=args.user_prompt
     )
+

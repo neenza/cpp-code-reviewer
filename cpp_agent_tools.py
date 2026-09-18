@@ -213,8 +213,13 @@ def read_project_file(
     end_line: Optional[int] = None,
     **kwargs: Any
 ) -> str:
-    """Read contents of a file in the project (such as CMakeLists.txt, configuration files, headers, or sources).
-    Line numbers are 1-indexed.
+    """Read contents of a file in the project (such as CMakeLists.txt, small configs, or targeted line ranges).
+    NOTE: NEVER read entire large files (> 80 lines) directly. Instead, use 'clangd_query' with:
+      - command='interface', symbol_or_query='<ClassName>' to inspect class layouts and public APIs.
+      - command='show', symbol_or_query='<ClassName::MethodName>' to inspect method definitions.
+      - command='usages', symbol_or_query='<SymbolName>' to inspect references across the project.
+      - Or provide 'start_line' and 'end_line' to read specific focused ranges (up to 80 lines).
+    Full file reads without line limits are strictly permitted only for small files (< 80 lines) or config files.
 
     Args:
       file_path: Relative path to the file to inspect (e.g. 'src/engine/worker.cpp'). Also accepts 'path' or 'filename'.
@@ -241,19 +246,37 @@ def read_project_file(
             lines = f.readlines()
 
         total_lines = len(lines)
+        is_config = target.name.lower() in ["cmakelists.txt", "conanfile.txt", "vcpkg.json"] or target.name.endswith(".json")
+
+        # Prohibit reading full large files (> 80 lines)
+        if start_line is None and end_line is None and total_lines > 80 and not is_config:
+            selected = lines[:60]
+            formatted = "".join(f"{i:4d} | {line}" for i, line in enumerate(selected, start=1))
+            return (
+                f"File: {resolved} (Showing lines 1-60 of {total_lines} total lines)\n\n{formatted}\n\n"
+                f"[Notice: File '{resolved}' has {total_lines} lines. Reading large files entirely is prohibited to prevent context bloat. "
+                f"Showing first 60 lines. Please prioritize using 'clangd_query(command='interface', symbol_or_query='<ClassName>')' "
+                f"to inspect class structure, 'clangd_query(command='show', symbol_or_query='<MethodName>')' to inspect method implementations, "
+                f"'clangd_query(command='usages', symbol_or_query='<SymbolName>')' for cross-file references, "
+                f"or specify 'start_line' and 'end_line' (max 80 lines) for a targeted range.]"
+            )
+
         start = max(1, start_line) if start_line is not None else 1
         end = min(total_lines, end_line) if end_line is not None else total_lines
 
         if start > total_lines:
             return f"Error: start_line {start} exceeds total lines ({total_lines})."
 
+        # Cap line window if too wide
+        if end - start + 1 > 100:
+            end = start + 99
+            capped_note = f"\n[Range capped at 100 lines to preserve context budget. Use clangd_query for semantic symbols.]"
+        else:
+            capped_note = ""
+
         selected = lines[start - 1:end]
         formatted = "".join(f"{i:4d} | {line}" for i, line in enumerate(selected, start=start))
-        return (
-            f"File: {resolved} (Lines {start}-{end} of {total_lines})\n\n{formatted}\n\n"
-            f"[ACTION REQUIRED: You have inspected '{resolved}'. Immediately invoke 'append_documentation_section' "
-            f"to document this component's functional role, classes, inner algorithms, and concurrency before exploring any other files.]"
-        )
+        return f"File: {resolved} (Lines {start}-{end} of {total_lines})\n\n{formatted}{capped_note}"
     except Exception as e:
         return f"Error reading file '{resolved}': {e}"
 
@@ -278,6 +301,89 @@ def extract_text(content: Any) -> str:
         return ""
     else:
         return str(content)
+
+
+def extract_message_text(msg: Any) -> str:
+    """Extract plain text from an AIMessage, content list, or string, with fallback to tool call args."""
+    if msg is None:
+        return ""
+    if isinstance(msg, str):
+        return msg.strip()
+
+    content = getattr(msg, "content", msg)
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item and item["text"]:
+                    parts.append(str(item["text"]))
+                elif "content" in item and item["content"]:
+                    parts.append(str(item["content"]))
+            elif hasattr(item, "text"):
+                parts.append(str(getattr(item, "text", "")))
+            elif hasattr(item, "content"):
+                parts.append(str(getattr(item, "content", "")))
+        combined = "".join(parts).strip()
+        if combined:
+            return combined
+
+    if hasattr(msg, "tool_calls") and msg.tool_calls:
+        for tc in msg.tool_calls:
+            args = tc.get("args", {})
+            if "markdown_content" in args and str(args["markdown_content"]).strip():
+                return str(args["markdown_content"]).strip()
+
+    return ""
+
+
+def discover_project_classes(project_dir: Path, ignored_dirs: Optional[set] = None) -> Dict[str, List[str]]:
+    """
+    Scan project files using regex to discover all class and struct declarations across the project.
+    Returns a dictionary mapping relative file path to list of declared class/struct names.
+    """
+    import re
+    ignored = {"build", ".cache", ".git", ".vscode", ".idea", "third_party", "thirdparty", "external", "vendor"}
+    if ignored_dirs:
+        ignored.update(d.lower() for d in ignored_dirs)
+
+    pattern = re.compile(r"^\s*(?:class|struct)\s+([A-Za-z0-9_]+)\b(?!\s*;)", re.MULTILINE)
+    file_to_classes: Dict[str, List[str]] = {}
+
+    for ext in ["*.h", "*.hpp", "*.hxx", "*.cpp", "*.cc", "*.cxx"]:
+        for file_path in sorted(project_dir.glob(f"**/{ext}")):
+            try:
+                rel = file_path.relative_to(project_dir)
+            except ValueError:
+                continue
+            if any(part.lower() in ignored or part.startswith(".") for part in rel.parts):
+                continue
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                matches = pattern.findall(content)
+                cleaned = [m for m in matches if m not in {"class", "struct", "void", "int", "bool", "char", "float", "double"}]
+                if cleaned:
+                    file_to_classes[str(rel)] = sorted(list(set(cleaned)))
+            except Exception:
+                pass
+
+    return file_to_classes
+
+
+def group_classes_by_module(file_to_classes: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Group discovered classes by parent module directory."""
+    module_classes: Dict[str, List[str]] = {}
+    for rel_file, classes in file_to_classes.items():
+        mod = str(Path(rel_file).parent)
+        if mod not in module_classes:
+            module_classes[mod] = []
+        module_classes[mod].extend(classes)
+    for mod in module_classes:
+        module_classes[mod] = sorted(list(set(module_classes[mod])))
+    return module_classes
 
 
 def get_llm(
@@ -364,3 +470,19 @@ def list_project_structure(max_files_per_dir: int = 15) -> str:
 
 
 COMMON_CPP_TOOLS = [clangd_query, ripgrep_search, read_project_file, list_project_structure]
+
+__all__ = [
+    "clangd_query",
+    "ripgrep_search",
+    "read_project_file",
+    "list_project_structure",
+    "COMMON_CPP_TOOLS",
+    "set_active_project_dir",
+    "get_active_project_dir",
+    "ensure_compile_commands",
+    "get_llm",
+    "extract_text",
+    "extract_message_text",
+    "discover_project_classes",
+    "group_classes_by_module",
+]

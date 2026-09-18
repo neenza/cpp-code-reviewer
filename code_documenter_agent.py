@@ -37,7 +37,9 @@ from cpp_agent_tools import (
     get_active_project_dir,
     ensure_compile_commands,
     get_llm,
-    extract_text
+    extract_text,
+    discover_project_classes,
+    group_classes_by_module
 )
 
 load_dotenv()
@@ -138,55 +140,31 @@ def manage_context_with_summarization(
 ) -> List[BaseMessage]:
     """
     Enforce strict context size limit with proactive rolling summarization.
-    - Default strict trigger: min(12000, max_tokens * 0.45) tokens, so the context is actively
-      summarized and kept lightweight on local models well before hitting 32k.
-    - Truncates individual tool outputs exceeding 600 tokens (approx 2,400 chars).
-    - Safely partitions history at turn boundaries and condenses older exploration steps
-      into a high-signal technical context summary (SystemMessage), reducing context size by >80%.
-    - Preserves valid [AIMessage, ToolMessage] pairing.
+    Never truncates active tool outputs to avoid information loss or code distortion.
+    When cumulative conversation tokens exceed the threshold, safely summarizes completed older turns
+    into a high-signal technical context summary while preserving recent active turns intact.
     """
     if summarize_threshold is None:
         summarize_threshold = min(12000, int(max_tokens * 0.45))
     effective_limit = min(summarize_threshold, max_tokens - reserve_tokens)
 
-    # Step 1: Truncate single massive tool outputs (over 600 tokens)
-    modified_tail: List[BaseMessage] = []
-    tail_modified = False
-    if len(messages) > 2:
-        preserved_header = messages[:2]
-        conversation_tail = messages[2:]
-        for msg in conversation_tail:
-            if isinstance(msg, ToolMessage):
-                content_str = extract_text(msg.content)
-                t_count = count_tokens(content_str)
-                if t_count > 600:
-                    truncated = content_str[:2200] + "\n... [Remaining tool output truncated for strict context budget]"
-                    modified_tail.append(ToolMessage(content=truncated, tool_call_id=msg.tool_call_id, name=msg.name))
-                    tail_modified = True
-                else:
-                    modified_tail.append(msg)
-            else:
-                modified_tail.append(msg)
-    else:
-        preserved_header = messages
-        conversation_tail = []
+    cur_tokens = sum(count_message_tokens(m) for m in messages)
 
-    cur_messages = preserved_header + modified_tail if tail_modified else messages
-    cur_tokens = sum(count_message_tokens(m) for m in cur_messages)
+    if cur_tokens <= effective_limit or len(messages) <= 3:
+        return messages
 
-    if cur_tokens <= effective_limit or len(cur_messages) <= 3:
-        return cur_messages
-
-    # Step 2: Context exceeds strict limit -> Perform Rolling Technical Summarization
+    # Context exceeds strict limit -> Perform Rolling Technical Summarization of older turns
     console.print(
         f"\n  [bold yellow][Notice] Context reached {cur_tokens:,} tokens (exceeding strict threshold {effective_limit:,}). "
         f"Active Rolling Summarization initiated...[/bold yellow]"
     )
 
-    tail_to_partition = modified_tail if tail_modified else list(cur_messages[2:])
-    history_to_summarize, recent_active_turns = partition_messages_safely(tail_to_partition, target_recent_count=2)
+    preserved_header = messages[:2] if len(messages) > 2 else messages
+    conversation_tail = list(messages[2:]) if len(messages) > 2 else []
+
+    history_to_summarize, recent_active_turns = partition_messages_safely(conversation_tail, target_recent_count=2)
     if not history_to_summarize:
-        return cur_messages
+        return messages
 
     # Extract exploration facts from history_to_summarize
     extracted_facts = []
@@ -475,10 +453,15 @@ CORE INSTRUCTIONS & STANDARDS:
      * Explain input validations, data transformations, error handling, return codes, and side effects.
      * Describe edge cases, failure recoveries, and performance considerations.
      * Explain dynamic interactions: trace how caller functions pass data into methods and what downstream effects occur.
-3. TECHNICAL ACCURACY & CONCRETENESS:
-   - Always cite exact source files, classes, methods, and line numbers (`include/order_repository.h`).
-   - Use `clangd_query` (`show`, `interface`, `hierarchy`, `signature`) to inspect actual implementations and method bodies.
-   - Use `ripgrep_search` to verify concurrency primitives (`mutex`, `shared_mutex`, `atomic`) and resource ownership (`std::unique_ptr`, `std::shared_ptr`, RAII).
+3. SEMANTIC CODE INSPECTION OVER FULL-FILE READS:
+   - AVOID FULL-FILE READS: NEVER use 'read_project_file' on large files (> 80 lines). Full file reads trigger severe context bloat and rate limits!
+     Full-file reading is strictly restricted to small files (< 80 lines) or build configs (CMakeLists.txt).
+   - Use 'clangd_query' with command='interface' and symbol_or_query='<ClassName>' to inspect class declarations, public interfaces, and member variables.
+   - Use 'clangd_query' with command='show' and symbol_or_query='<ClassName::MethodName>' to inspect method bodies, inner logic, and step-by-step algorithms.
+   - Use 'clangd_query' with command='usages' to inspect callers, references, and data-flow across the codebase.
+   - Use 'ripgrep_search' with pattern='class ' or 'struct ' to discover all classes and structs in the codebase.
+   - You MUST ensure all symbols, classes, and key functions in the assigned module are read and documented at least once!
+   - Use 'ripgrep_search' to verify concurrency primitives ('mutex', 'shared_mutex', 'atomic') and resource ownership (smart pointers, RAII).
 4. DIAGRAMS & FLOWCHARTS (MERMAID ONLY):
    - Whenever illustrating architecture, class relationships, state transitions, or execution flows, you MUST use Mermaid diagrams ONLY inside fenced code blocks (` ```mermaid ... ``` `).
    - Do NOT use ASCII art, plain text boxes, or pseudo-code drawings for diagrams.
@@ -505,11 +488,13 @@ CORE INSTRUCTIONS & STANDARDS:
 class DocumenterState(TypedDict):
     project_dir: str
     output_file: str
+    user_prompt: str
     target_dirs: Optional[List[str]]
     ignore_dirs: Optional[List[str]]
     all_files: List[str]
     modules: List[str]
     module_files_map: Dict[str, List[str]]
+    module_classes_map: Dict[str, List[str]]
     current_module_index: int
     sections_count: int
     max_context_tokens: int
@@ -527,6 +512,10 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     out_file = Path(state["output_file"]).resolve()
 
     console.print("\n[bold cyan]═══ Phase 1: Codebase Discovery, Entry Point Detection & Documentation Planning ═══[/bold cyan]")
+
+    user_prompt = state.get("user_prompt", "")
+    if user_prompt:
+        console.print(f"[cyan][User Documentation Directive]: {user_prompt}[/cyan]")
 
     init_documentation_file(out_file, proj_path.name)
 
@@ -559,6 +548,11 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
 
     all_files = sorted(list(set([str(h) for h in headers] + [str(s) for s in sources])))
 
+    # Discover classes and structs across project files
+    file_to_classes = discover_project_classes(proj_path, ignored_dirs=ignored)
+    module_classes_map = group_classes_by_module(file_to_classes)
+    total_classes = sum(len(c) for c in module_classes_map.values())
+
     module_map: Dict[str, List[str]] = {}
     for f in all_files:
         parent = str(Path(f).parent)
@@ -569,8 +563,7 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     sorted_modules = sorted(list(module_map.keys()))
 
     console.print(f"[green]Discovered {len(all_files)} total C++ files across {len(sorted_modules)} directories/modules.[/green]")
-    for mod in sorted_modules:
-        console.print(f"  - [bold]{escape(mod)}/[/bold] ({len(module_map[mod])} files)")
+    console.print(f"[green]Discovered {total_classes} declared classes/structs across repository (scanned via rg class/struct).[/green]")
 
     # 1. Detect Entry Point (where application starts execution)
     entry_point_files: List[str] = []
@@ -608,7 +601,9 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
             modules_to_document = filtered
             console.print(f"\n[bold green]Target Scope Applied:[/bold green] Queued {len(modules_to_document)} module(s) under [{', '.join(norm_targets)}] for documentation:")
             for mod in modules_to_document:
-                console.print(f"  * [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files)")
+                m_classes = module_classes_map.get(mod, [])
+                cls_tag = f" — Classes: {', '.join(m_classes)}" if m_classes else ""
+                console.print(f"  * [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files){cls_tag}")
             console.print("[dim]Note: Other folders can still be queried by clangd-query/rg for references if needed.[/dim]\n")
         else:
             console.print(f"[yellow]Warning: No modules matched target directories: {target_dirs}. Documenting all discovered modules.[/yellow]")
@@ -637,7 +632,9 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     console.print(f"\n[bold green]Determined Documentation Order ({len(modules_to_document)} modules):[/bold green]")
     for rank, mod in enumerate(modules_to_document, 1):
         tag = " [bold magenta][Entry Point][/bold magenta]" if (entry_point_module and mod == entry_point_module) else ""
-        console.print(f"  {rank}. [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files){tag}")
+        m_classes = module_classes_map.get(mod, [])
+        cls_tag = f" — Classes: {', '.join(m_classes)}" if m_classes else ""
+        console.print(f"  {rank}. [bold cyan]{escape(mod)}/[/bold cyan] ({len(module_map[mod])} files){cls_tag}{tag}")
 
     # Read CMakeLists.txt to build Section 1
     cmakelists = proj_path / "CMakeLists.txt"
@@ -654,6 +651,9 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
         f"### Overview\n"
         f"This repository contains **{len(all_files)} C++ files** organized across **{len(sorted_modules)} directories**.\n"
     )
+    if user_prompt:
+        sec1_content += f"> **User Initial Documentation Directive**: {user_prompt}\n\n"
+
     if entry_point_files:
         sec1_content += f"> **Primary Application Entry Point**: `{entry_point_files[0]}` (Module `{entry_point_module}/`)\n\n"
 
@@ -668,7 +668,9 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
     sec1_content += "### Directory & Module Layout\n"
     for mod in sorted_modules:
         marker = "*(Documented)*" if mod in modules_to_document else "*(Reference)*"
-        sec1_content += f"- **`{mod}/`** ({len(module_map[mod])} files) {marker}:\n"
+        m_classes = module_classes_map.get(mod, [])
+        cls_info = f" (Classes: {', '.join(m_classes)})" if m_classes else ""
+        sec1_content += f"- **`{mod}/`** ({len(module_map[mod])} files){cls_info} {marker}:\n"
         for f in module_map[mod][:8]:
             sec1_content += f"  - `{Path(f).name}`\n"
         if len(module_map[mod]) > 8:
@@ -687,8 +689,10 @@ def doc_discover_and_plan_node(state: DocumenterState) -> Dict[str, Any]:
         "all_files": all_files,
         "modules": modules_to_document,
         "module_files_map": module_map,
+        "module_classes_map": module_classes_map,
         "current_module_index": 0,
-        "sections_count": 1
+        "sections_count": 1,
+        "user_prompt": user_prompt
     }
 
 
@@ -1064,20 +1068,46 @@ def document_module_node_factory(
 
         arch_memory = format_architectural_memory()
 
+        # Discovered classes for this module
+        mod_classes = state.get("module_classes_map", {}).get(current_module, [])
+        classes_str = ", ".join(f"`{c}`" for c in mod_classes) if mod_classes else "None directly declared (audit member/free functions)"
+
+        user_prompt_section = ""
+        user_prompt = state.get("user_prompt", "")
+        if user_prompt:
+            user_prompt_section = (
+                f"════════════════════════════════════════════════════════════════════════════════\n"
+                f"USER INITIAL DOCUMENTATION DIRECTIVE (HIGH PRIORITY FOCUS):\n"
+                f"{user_prompt}\n"
+                f"Ensure your documentation specifically addresses and emphasizes this directive.\n"
+                f"════════════════════════════════════════════════════════════════════════════════\n\n"
+            )
+
         prompt = (
             f"You are writing in-depth functional C++ documentation for module '{current_module}'.\n"
             f"Files in this module:\n" + "\n".join(f"- {f}" for f in files) + "\n\n"
+            f"Known Classes & Structs in this module (discovered via 'rg class/struct'):\n{classes_str}\n\n"
+            f"{user_prompt_section}"
             f"{arch_memory}\n\n"
-            f"MANDATORY INCREMENTAL DOCUMENTATION PROTOCOL:\n"
-            f"DO NOT read all files first! You must document each concept immediately as you explore it:\n"
-            f"1. OVERVIEW (Turn 1): Inspect the main header/CMake or entry structure. Immediately invoke 'append_documentation_section' with level=2 for the module's architecture and layout.\n"
-            f"2. COMPONENT ITERATION: For each key file or subsystem:\n"
-            f"   - Inspect that component using 'read_project_file' or 'clangd_query'.\n"
-            f"   - IMMEDIATELY invoke 'append_documentation_section' (with level=3) to document that component's functional role, inner algorithms, public methods, and concurrency synchronization.\n"
-            f"   - Do NOT inspect a new file until the previous one is documented!\n"
-            f"3. MERMAID DIAGRAMS: Include Mermaid diagrams (strictly inside ```mermaid ... ```, no ASCII art) showing component interactions.\n"
-            f"4. CONCLUDE: When all files/components in '{current_module}' have been documented, reply stating that documentation for this module is complete (with no more tool calls).\n\n"
-            f"Begin by exploring the first file or structure using 'read_project_file' or 'clangd_query'."
+            f"MANDATORY CODE INSPECTION & DOCUMENTATION PROTOCOL:\n"
+            f"1. AVOID FULL-FILE READS: NEVER use 'read_project_file' on large files (> 80 lines). Full file reads trigger severe context bloat! "
+            f"Full-file reading is strictly restricted to small files (< 80 lines) or build configs (CMakeLists.txt).\n"
+            f"2. SEMANTIC CLASS INSPECTION:\n"
+            f"   - For each class/struct in this module ({classes_str}), call 'clangd_query(command=\"interface\", symbol_or_query=\"<ClassName>\")' "
+            f"to inspect public interfaces, member variables, and methods.\n"
+            f"   - For member function bodies, algorithms, and inner logic, call 'clangd_query(command=\"show\", symbol_or_query=\"<ClassName::MethodName>\")'.\n"
+            f"   - For cross-file dependencies and callers, call 'clangd_query(command=\"usages\", symbol_or_query=\"<SymbolName>\")'.\n"
+            f"3. FUNCTION AUDIT & ENSURE ALL SYMBOLS INSPECTED:\n"
+            f"   - For standalone functions, inspect with 'clangd_query(command=\"show\", symbol_or_query=\"<FunctionName>\")'.\n"
+            f"   - Ensure ALL symbols, classes, and member functions in this module are read and documented at least once!\n"
+            f"   - Use 'ripgrep_search' with pattern='class ' or 'struct ' to discover any additional unmapped types.\n"
+            f"4. INCREMENTAL DOCUMENTATION PROTOCOL:\n"
+            f"   - Document incrementally! Call 'append_documentation_section' after inspecting each component/class hierarchy.\n"
+            f"   - Do NOT read all files first; document as you go.\n"
+            f"5. MERMAID DIAGRAMS:\n"
+            f"   - Include Mermaid diagrams (strictly inside ```mermaid ... ```, no ASCII art) showing component interactions.\n"
+            f"6. CONCLUDE: When all files/components in '{current_module}' have been documented, reply stating documentation is complete.\n\n"
+            f"Begin by inspecting the first class or structure using 'clangd_query' or 'read_project_file'."
         )
 
         sub_state: ModuleAgentState = {
@@ -1270,6 +1300,7 @@ def run_codebase_documenter(
 
     target_display = f"[cyan]{', '.join(target_dirs)}[/cyan]" if target_dirs else "[yellow]All repository modules[/yellow]"
     ignore_display = f"[red]{', '.join(ignore_dirs)}[/red]" if ignore_dirs else "[dim]Standard build/vendor artifacts[/dim]"
+    user_prompt_display = f"\nUser Directive  : [yellow]{user_prompt}[/yellow]" if user_prompt else ""
 
     console.print(Panel(
         f"[bold cyan]Autonomous C++ Codebase Documentation Agent[/bold cyan]\n"
@@ -1282,7 +1313,8 @@ def run_codebase_documenter(
         f"Context Limit   : [magenta]{max_context_tokens:,} tokens (32k window guard)[/magenta]\n"
         f"Summarize Limit : [magenta]{summarize_threshold:,} tokens (proactive compression)[/magenta]\n"
         f"Steps / Module  : [yellow]{module_max_steps}[/yellow]\n"
-        f"Tools Active    : [blue]clangd-query, ripgrep (rg), read_project_file, append_documentation_section[/blue]",
+        f"Tools Active    : [blue]clangd-query, ripgrep (rg), read_project_file, append_documentation_section[/blue]"
+        f"{user_prompt_display}",
         title="Agent Configuration",
         border_style="cyan"
     ))
@@ -1303,11 +1335,13 @@ def run_codebase_documenter(
     initial_state: DocumenterState = {
         "project_dir": str(proj_path),
         "output_file": str(out_file),
+        "user_prompt": user_prompt,
         "target_dirs": target_dirs,
         "ignore_dirs": ignore_dirs,
         "all_files": [],
         "modules": [],
         "module_files_map": {},
+        "module_classes_map": {},
         "current_module_index": 0,
         "sections_count": 0,
         "max_context_tokens": max_context_tokens,
@@ -1384,6 +1418,13 @@ def parse_args():
         default=50,
         help="Maximum tool steps per module exploration (default: 50)"
     )
+    parser.add_argument(
+        "--user-prompt", "--initial-prompt", "-u",
+        dest="user_prompt",
+        type=str,
+        default="",
+        help="Initial user prompt or specific documentation focus directive to guide the documenter agent."
+    )
     return parser.parse_args()
 
 
@@ -1407,5 +1448,6 @@ if __name__ == "__main__":
         summarize_threshold=args.context_summarize_threshold,
         module_max_steps=args.max_steps,
         target_dirs=targets,
-        ignore_dirs=ignores
+        ignore_dirs=ignores,
+        user_prompt=args.user_prompt
     )

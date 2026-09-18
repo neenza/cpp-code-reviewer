@@ -4,18 +4,26 @@ A modular suite of intelligent C++ engineering agents built with **LangGraph**, 
 
 ---
 
-## 🛠️ Agents Overview
+## Agents Overview
 
 ### 1. Autonomous C++ Code Review Agent (`code_review_agent.py`)
-- **Purpose**: Autonomous, exhaustive code review across 100+ file codebases without conversational context fatigue.
-- **Architecture**: Deterministic multi-node Map-Reduce orchestrator (Planning $\rightarrow$ Module-by-Module Audit $\rightarrow$ Final Synthesis).
+- **Purpose**: Autonomous, exhaustive code review across 100+ file codebases without conversational context fatigue or skipped files.
+- **Architecture**: Deterministic multi-node Map-Reduce orchestrator (Planning -> Module-by-Module Audit -> Final Synthesis).
+- **Symbol & Class Discovery**: Scans repository headers and sources (`rg class/struct`) to index all declared classes, structs, and interfaces before exploration starts.
+- **Semantic Code Inspection**: Prioritizes `clangd-query interface` (class layouts/APIs), `clangd-query show` (member implementations and algorithms), and `clangd-query usages` (cross-file reference validation), strictly avoiding full-file code dumps of large files.
+- **Strict Context Management**: Real-time context token banner printing before every tool call, paired with proactive rolling summarization (`--context-summarize-threshold`) that preserves recent tool outputs while summarizing older history.
+- **User Directives**: Accepts initial review directives via `--user-prompt` (`-u`), injecting targeted focus areas into module prompts and the final synthesis report.
 - **Output**: Generates a structured 4-part Code Review Report (`CPP_CODE_REVIEW_REPORT.md`).
 
 ### 2. Autonomous Codebase Documentation Agent (`code_documenter_agent.py`)
 - **Purpose**: Explores the repository folder-by-folder and incrementally generates publication-grade Markdown documentation.
 - **Incremental Writing**: Uses `append_documentation_section` to immediately flush documented modules and classes to disk, preventing data loss and memory exhaustion.
-- **Strict Context Budget**: Enforces an active **32k context size limit** (configurable via `--max-context-tokens`) using token-budget message trimming so that context never bloats or exceeds model ceilings.
-- **Output**: Generates `CODEBASE_DOCUMENTATION.md` with Table of Contents, architecture overview, class specifications, and concurrency models.
+- **Cross-Folder Architectural Memory**: Carries a structured architectural ledger across folders, connecting components and establishing data-flow relationships without redundant explanations.
+- **Symbol & Class Discovery**: Discovers all classes and structs across the codebase to ensure every symbol and key function is documented at least once.
+- **Targeted Semantic Exploration**: Prioritizes `clangd-query interface`, `show`, and `usages` over full-file reads.
+- **Strict Context Budget**: Enforces an active context token ceiling (`--max-context-tokens`, default: 32k) and rolling history summarization (`--context-summarize-threshold`).
+- **User Directives**: Accepts custom initial directives via `--user-prompt` (`-u`) to guide documentation depth, architectural perspective, or component focus.
+- **Output**: Generates `CODEBASE_DOCUMENTATION.md` with Table of Contents, architecture overview, class specifications, and Mermaid diagrams.
 
 ### 3. Interactive Codebase Explainer & Tutor (`code_explainer_agent.py`)
 - **Purpose**: Dedicated **interactive guide** whose sole job is to help developers deeply understand an existing codebase.
@@ -32,9 +40,10 @@ A modular suite of intelligent C++ engineering agents built with **LangGraph**, 
 - Centralized reusable toolset powering all C++ agents:
   - **`clangd_query`**: Semantic AST code intelligence (`search`, `show`, `usages`, `hierarchy`, `signature`, `interface`).
   - **`ripgrep_search`**: High-performance regex text search for memory management keywords (`malloc`, `free`, `new`, `delete`, `strcpy`), concurrency primitives, and raw pointer patterns.
-  - **`read_project_file`**: Bounded file reader with line range slicing.
+  - **`read_project_file`**: Bounded file reader with line-range slicing; protects context budget by capping unconstrained reads of large files (>80 lines) to 60 lines and directing models to semantic AST queries.
+  - **`discover_project_classes` & `group_classes_by_module`**: Project-wide scanning and aggregation of classes/structs.
   - **`list_project_structure`**: Rapid inventory and directory mapping.
-  - **`get_llm`**: Multi-model factory supporting local/offline Ollama and Google Gemini.
+  - **`get_llm`**: Multi-model factory supporting local/offline Ollama (`num_ctx` allocation) and Google Gemini.
 
 ---
 
@@ -43,8 +52,8 @@ A modular suite of intelligent C++ engineering agents built with **LangGraph**, 
 ```
 codereviewagent/
 ├── cpp_agent_tools.py         # Shared C++ tools (clangd-query, ripgrep, file reader, LLM factory)
-├── code_review_agent.py       # Autonomous code review orchestrator (Map-Reduce)
-├── code_documenter_agent.py   # Autonomous documentation agent with 32k context limit
+├── code_review_agent.py       # Autonomous code review orchestrator (Map-Reduce, context summarizer)
+├── code_documenter_agent.py   # Autonomous documentation agent (incremental Markdown, 32k context guard)
 ├── code_explainer_agent.py    # Interactive codebase explainer & tutor REPL
 ├── test_agent_tools.py        # Unit test suite verifying tools & agents
 ├── AGENT.md                   # Detailed clangd-query specifications & usage guidelines
@@ -85,7 +94,7 @@ source venv/bin/activate
 pip install langgraph langchain-core langchain-ollama langchain-google-genai rich python-dotenv tiktoken
 ```
 
-### 3. Configure API Keys (for Gemini testing)
+### 3. Configure API Keys (for Gemini backend)
 Copy `.env.example` to `.env` and set your API key:
 ```bash
 cp .env.example .env
@@ -96,22 +105,52 @@ cp .env.example .env
 
 ## Usage Guide
 
-### 📖 Running the Autonomous Codebase Documenter (32k Context Limit)
+### Running the Autonomous Code Reviewer
+
 ```bash
-# Using Google Gemini (document all core modules starting from the entry point):
-python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
+# Basic review using Google Gemini:
+python code_review_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
 
-# Ignoring specific folders/subfolders (e.g. tests, benchmarks, legacy, vendor):
-python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir /path/to/cpp_project --ignore-dirs "tests,benchmarks,legacy"
+# Review with custom initial prompt/focus directive:
+python code_review_agent.py --provider gemini --model gemini-3.5-flash-lite \
+  --project-dir /path/to/cpp_project \
+  --user-prompt "Audit multithreading synchronization, race conditions in SessionManager, and exception safety in payment flows"
 
-# Documenting only specific target folders (e.g. src and include):
-python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir /path/to/cpp_project --target-dirs "src,include" --ignore-dirs "tests"
-
-# Using Local/Offline Ollama with custom context limit:
-python code_documenter_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project --max-context-tokens 32000 --target-dirs "src/core,src/engine"
+# Review using local Ollama with custom context ceiling and summarization trigger:
+python code_review_agent.py --provider ollama --model llama3.1:8b \
+  --project-dir /path/to/cpp_project \
+  --max-context-tokens 32000 \
+  --context-summarize-threshold 12000 \
+  --user-prompt "Focus on raw pointer lifecycles and modern C++20 best practices"
 ```
 
-### 🚀 Running the Interactive Codebase Explainer
+### Running the Autonomous Codebase Documenter
+
+```bash
+# Document all core modules using Google Gemini:
+python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
+
+# Document with an initial focus directive:
+python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite \
+  --project-dir /path/to/cpp_project \
+  --user-prompt "Emphasize concurrency guarantees, mutex locking strategies, and class inheritance hierarchies"
+
+# Document only specific target folders while ignoring tests:
+python code_documenter_agent.py --provider gemini --model gemini-3.5-flash-lite \
+  --project-dir /path/to/cpp_project \
+  --target-dirs "src,include" \
+  --ignore-dirs "tests,benchmarks"
+
+# Document using local Ollama with custom context limit and summarization threshold:
+python code_documenter_agent.py --provider ollama --model llama3.1:8b \
+  --project-dir /path/to/cpp_project \
+  --max-context-tokens 32000 \
+  --context-summarize-threshold 12000 \
+  --target-dirs "src/core,src/engine"
+```
+
+### Running the Interactive Codebase Explainer
+
 ```bash
 # Using Google Gemini API:
 python code_explainer_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
@@ -120,36 +159,29 @@ python code_explainer_agent.py --provider gemini --model gemini-3.5-flash-lite -
 python code_explainer_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project
 ```
 
-### 🔍 Running the Autonomous Code Reviewer
-```bash
-# Using Google Gemini API:
-python code_review_agent.py --provider gemini --model gemini-3.5-flash-lite --project-dir sample_project
-
-# Using Local/Offline Ollama:
-python code_review_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project
-```
-
 ---
 
-## CLI Options
+## CLI Options Reference
 
-| Argument | Description | Default |
-|---|---|---|
-| `--project-dir`, `-p` | Path to the target C++ codebase | `./sample_project` |
-| `--target-dirs`, `--include-dirs` | Comma-separated folders to generate documentation for (e.g. `src,include`). External/vendor code can still be accessed by tools for reference, but won't be documented. | All repository modules |
-| `--ignore-dirs` | Comma-separated folders/subfolders to ignore completely from documentation (e.g. `tests,benchmarks,legacy`). | Built-in build/vendor exclusions |
-| `--output`, `-o` | Output Markdown file path | `<project-dir>/CODEBASE_DOCUMENTATION.md` or `CPP_CODE_REVIEW_REPORT.md` |
-| `--provider` | LLM backend: `gemini`, `google`, or `ollama` | `gemini` |
-| `--model`, `-m` | Model name (e.g., `gemini-3.5-flash-lite`, `llama3.1:8b`, `qwen2.5:14b`) | `gemini-3.5-flash-lite` |
-| `--ollama-host` | URL of the Ollama server | `http://localhost:11434` |
-| `--max-context-tokens`| Context size ceiling enforced via message trimmer (`code_documenter_agent.py`)| `32000` (32k) |
-| `--max-steps` | Maximum execution steps per module | `50` (documenter) / `300` (reviewer) / `60` (explainer) |
+| Argument | Short Flag | Applicable Agent(s) | Description | Default |
+|---|---|---|---|---|
+| `--project-dir` | `-p` | All | Path to the target C++ codebase directory | `./sample_project` |
+| `--provider` | | All | LLM provider backend: `gemini`, `google`, or `ollama` | `gemini` |
+| `--model` | `-m` | All | Model name (e.g., `gemini-3.5-flash-lite`, `llama3.1:8b`, `qwen2.5:14b`) | Provider default |
+| `--ollama-host` | | All | URL of the local Ollama server | `http://localhost:11434` |
+| `--user-prompt`, `--initial-prompt` | `-u` | Reviewer, Documenter | Initial custom prompt or focus directive guiding the agent's audit or documentation | `""` (none) |
+| `--max-context-tokens` | | Reviewer, Documenter | Maximum context token ceiling allocated and monitored across execution | `32000` (32k) |
+| `--context-summarize-threshold` | | Reviewer, Documenter | Token threshold to proactively trigger rolling summarization of completed turns | `12000` tokens |
+| `--output` | `-o` | Reviewer, Documenter | Custom file path for generated Markdown report or documentation | Default filename in project dir |
+| `--target-dirs`, `--include-dirs` | | Documenter | Comma-separated list of folders to document (e.g. `src,include`). Other folders remain accessible for reference | All discovered modules |
+| `--ignore-dirs` | | Reviewer, Documenter | Comma-separated directory names to ignore during planning (e.g. `tests,benchmarks,legacy`) | Standard build/vendor exclusions |
+| `--max-steps` | | All | Maximum recursion execution steps per module exploration | `50` (documenter) / `500` (reviewer) / `60` (explainer) |
 
 ---
 
 ## Running Unit Tests
 
-Run the test suite verifying `clangd-query`, `ripgrep`, shared tools, 32k context trimmer, and LangGraph agent graphs:
+Run the test suite verifying `clangd-query`, `ripgrep`, shared tools, context management, and LangGraph agent graphs:
 ```bash
-./venv/bin/python3 test_agent_tools.py
+./venv/bin/python test_agent_tools.py
 ```

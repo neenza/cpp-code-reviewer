@@ -50,10 +50,10 @@ EXPLAINER_SYSTEM_PROMPT = """You are an expert C++ Software Architect and Codeba
 
 ════════════════════════════════════════════════════════════════════════════════
 CORE DIRECTIVES (WHAT YOU DO AND DO NOT DO):
-1. ✅ INVESTIGATE & EXPLAIN: Your mission is to explore the existing code using your tools (clangd_query, ripgrep_search, read_project_file) and explain how the system works.
-2. ❌ NO CODE WRITING OR DEBUGGING: You do NOT generate code implementations, fix bugs, write documentation files, or write unit tests. If asked to write new features or debug, clarify the existing logic instead.
-3. 🎯 GROUNDED CITATIONS: Always ground your explanations in the actual codebase. Mention exact file paths, line numbers (`file.cpp:42-50`), class names, and method signatures found via tools.
-4. 🧠 PROGRESSIVE & ADAPTIVE EXPLANATION:
+1. INVESTIGATE & EXPLAIN: Your mission is to explore the existing code using your tools (clangd_query, ripgrep_search, read_project_file) and explain how the system works.
+2. NO CODE WRITING OR DEBUGGING: You do NOT generate code implementations, fix bugs, write documentation files, or write unit tests. If asked to write new features or debug, clarify the existing logic instead.
+3. GROUNDED CITATIONS: Always ground your explanations in the actual codebase. Mention exact file paths, line numbers (`file.cpp:42-50`), class names, and method signatures found via tools.
+4. PROGRESSIVE & ADAPTIVE EXPLANATION:
    - Always assess the user's technical background and familiarity with the codebase.
    - If the user asks a high-level question, start with a clear architectural mental model, component diagram, or high-level narrative.
    - If the user asks deep technical questions, dive straight into concurrency models, memory lifecycles, RAII semantics, and cache-friendly designs.
@@ -188,7 +188,7 @@ def run_interactive_explainer(
 
         if user_input.lower() == "/clear":
             conversation_history = [SystemMessage(content=EXPLAINER_SYSTEM_PROMPT)]
-            console.print("[bold cyan]✔ Conversation history cleared.[/bold cyan]\n")
+            console.print("[bold cyan][OK] Conversation history cleared.[/bold cyan]\n")
             continue
 
         if user_input.lower() == "/help":
@@ -239,7 +239,7 @@ def run_interactive_explainer(
         # Append user message
         conversation_history.append(HumanMessage(content=effective_prompt))
 
-        console.print(f"\n[dim cyan]🔍 Investigating codebase...[/dim cyan]")
+        console.print(f"\n[dim cyan]Investigating codebase...[/dim cyan]")
 
         # Stream graph execution
         current_state = {"messages": conversation_history}
