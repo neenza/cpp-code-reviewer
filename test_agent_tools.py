@@ -657,6 +657,155 @@ From src/order_repository.cpp:6:23 (definition)
         self.assertIn(t3, trimmed)
         self.assertIn(ai_req, trimmed)
 
+    def test_documenter_module_routing_with_enforcement(self):
+        from code_documenter_agent import build_module_documenter_runner, init_documentation_file
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_doc = Path(tmpdir) / "TEST_DOC.md"
+            init_documentation_file(test_doc, "TestProject")
+
+            class ScriptedDocumenterLLM:
+                def __init__(self):
+                    self.calls = 0
+
+                def bind_tools(self, tools):
+                    return self
+
+                def invoke(self, messages):
+                    self.calls += 1
+                    # Turn 1: Query class interface
+                    if self.calls == 1:
+                        return AIMessage(
+                            content="",
+                            tool_calls=[{
+                                "name": "clangd_query",
+                                "args": {"command": "interface", "symbol_or_query": "SessionManager"},
+                                "id": "tc_iface"
+                            }]
+                        )
+                    # Turn 2: Premature exit without tool calls
+                    elif self.calls == 2:
+                        return AIMessage(content="SessionManager looks nice. Concluding module.")
+                    # Turn 3: Received enforce_documentation nudge! Inspect method and append section
+                    elif self.calls == 3:
+                        return AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": "clangd_query",
+                                    "args": {"command": "show", "symbol_or_query": "SessionManager::create_session"},
+                                    "id": "tc_show"
+                                },
+                                {
+                                    "name": "append_documentation_section",
+                                    "args": {
+                                        "section_title": "Session Management Subsystem",
+                                        "markdown_content": "### Architecture\nSessionManager handles sessions.\n```mermaid\ngraph TD\n  A --> B\n```",
+                                        "level": 2
+                                    },
+                                    "id": "tc_append"
+                                }
+                            ]
+                        )
+                    # Turn 4: Final response
+                    else:
+                        return AIMessage(content="Documentation is complete.")
+
+            app = build_module_documenter_runner(llm=ScriptedDocumenterLLM(), max_context_tokens=32000)
+            initial_state = {
+                "messages": [HumanMessage(content="Document module src")],
+                "module_name": "src",
+                "user_prompt": "",
+                "target_files": ["src/session_manager.cpp"],
+                "target_classes": ["SessionManager"],
+                "interfaced_classes": [],
+                "discovered_functions": [],
+                "documented_functions": [],
+                "in_flight_functions": [],
+                "documented_files": [],
+                "nudge_count": 0,
+                "max_nudges": 2,
+                "append_called": False,
+                "append_count": 0,
+                "uncommitted_explorations": 0,
+                "reminder_count": 0
+            }
+
+            res = app.invoke(initial_state, {"recursion_limit": 30})
+            self.assertGreater(res["nudge_count"], 0)
+            self.assertIn("SessionManager", res["interfaced_classes"])
+            self.assertTrue(any("create_session" in f for f in res["documented_functions"]))
+            self.assertTrue(res["append_called"])
+            self.assertGreater(res["append_count"], 0)
+            self.assertTrue(test_doc.exists())
+            doc_text = test_doc.read_text(encoding="utf-8")
+            self.assertIn("Session Management Subsystem", doc_text)
+
+    def test_documenter_manage_context_with_summarization_ledger(self):
+        from code_documenter_agent import manage_context_with_summarization
+        from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+
+        sys_msg = SystemMessage(content="System prompt")
+        user_msg = HumanMessage(content="Document module src")
+        older_ai = AIMessage(content="Older exploration turn notes.")
+        ai_req = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "OrderRepository::add_order"}, "id": "call_add"}
+            ]
+        )
+        large_tool = ToolMessage(
+            content="void add_order() {\n" + "    // implementation code\n" * 300 + "}",
+            tool_call_id="call_add",
+            name="clangd_query"
+        )
+
+        messages = [sys_msg, user_msg, older_ai, ai_req, large_tool]
+
+        audit_state = {
+            "module_name": "src",
+            "target_classes": ["OrderRepository", "PaymentProcessor"],
+            "interfaced_classes": ["OrderRepository"],
+            "discovered_functions": [
+                "OrderRepository::add_order",
+                "OrderRepository::count",
+                "PaymentProcessor::process"
+            ],
+            "documented_functions": [],
+            "in_flight_functions": ["OrderRepository::add_order"],
+            "target_files": ["src/order_repository.cpp", "src/payment_processor.cpp"],
+            "documented_files": ["src/order_repository.cpp"]
+        }
+
+        trimmed = manage_context_with_summarization(
+            messages,
+            max_tokens=2500,
+            reserve_tokens=300,
+            summarize_threshold=800,
+            audit_state=audit_state
+        )
+
+        summary_msg = trimmed[2]
+        content = summary_msg.content
+
+        self.assertIn("Documentation Progress Ledger for Module 'src'", content)
+        self.assertIn("CURRENTLY UNDER ACTIVE REVIEW", content)
+        self.assertIn("OrderRepository::add_order", content)
+        self.assertIn("REMAINING TO BE DOCUMENTED (PRIORITIZE)", content)
+        self.assertIn("OrderRepository::count", content)
+        self.assertIn("PaymentProcessor::process", content)
+        self.assertIn("ALREADY INTERFACED (DO NOT RE-QUERY)", content)
+        self.assertIn("OrderRepository", content)
+        self.assertIn("REMAINING CLASSES TO INTERFACE", content)
+        self.assertIn("PaymentProcessor", content)
+        self.assertIn("REMAINING UNINSPECTED FILES", content)
+        self.assertIn("src/payment_processor.cpp", content)
+
+        # Active tool message preserved in full fidelity
+        self.assertIn(large_tool, trimmed)
+        self.assertIn(ai_req, trimmed)
+
 
 if __name__ == "__main__":
     unittest.main()

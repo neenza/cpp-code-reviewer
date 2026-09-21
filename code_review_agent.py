@@ -920,7 +920,7 @@ def review_module_node_factory(
             "audited_files": [],
             "nudge_count": 0,
             "findings_at_start": len(_RECORDED_FINDINGS),
-            "max_nudges": 15
+            "max_nudges": min(15, max(1, (module_max_steps - 3) // 2))
         }
 
         findings_before = len(_RECORDED_FINDINGS)

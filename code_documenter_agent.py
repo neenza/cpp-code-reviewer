@@ -39,7 +39,10 @@ from cpp_agent_tools import (
     get_llm,
     extract_text,
     discover_project_classes,
-    group_classes_by_module
+    group_classes_by_module,
+    parse_interface_methods,
+    discover_module_functions,
+    extract_touched_files
 )
 
 load_dotenv()
@@ -144,14 +147,18 @@ def manage_context_with_summarization(
     messages: List[BaseMessage],
     max_tokens: int = 32000,
     reserve_tokens: int = 2500,
-    summarize_threshold: Optional[int] = None
+    summarize_threshold: Optional[int] = None,
+    audit_state: Optional[Dict[str, Any]] = None
 ) -> List[BaseMessage]:
     """
     Enforce strict context size limit with proactive rolling summarization.
     Never truncates active tool outputs to avoid information loss or code distortion.
     When cumulative conversation tokens exceed the threshold, safely summarizes completed older turns
     into a high-signal technical context summary while preserving recent active turns intact.
+    Injects the live documentation progress ledger (content already covered vs. remaining to document)
+    directly into the condensed context to prevent repetitive tool queries and focus exploration.
     """
+    global _DOCUMENTED_SECTIONS
     if summarize_threshold is None:
         summarize_threshold = min(12000, int(max_tokens * 0.45))
     effective_limit = min(summarize_threshold, max_tokens - reserve_tokens)
@@ -187,7 +194,92 @@ def manage_context_with_summarization(
             if text and len(text) > 30 and not is_substantive_documentation(text):
                 extracted_facts.append(f"• Exploration Note: {text[:250].replace(chr(10), ' ')}")
 
-    global _DOCUMENTED_SECTIONS
+    progress_section = ""
+    if audit_state:
+        target_classes = audit_state.get("target_classes", [])
+        interfaced_classes = set(audit_state.get("interfaced_classes", []))
+        remaining_classes = [c for c in target_classes if c not in interfaced_classes]
+        covered_classes = [c for c in target_classes if c in interfaced_classes]
+
+        in_flight_raw = set(audit_state.get("in_flight_functions", []))
+        # Dynamically discover any symbols actively queried in recent_active_turns
+        for m in recent_active_turns:
+            if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+                for tc in m.tool_calls:
+                    if tc.get("name") == "clangd_query" and tc.get("args", {}).get("command") == "show":
+                        sym = tc.get("args", {}).get("symbol_or_query") or tc.get("args", {}).get("symbol") or ""
+                        if sym:
+                            in_flight_raw.add(sym)
+                            in_flight_raw.add(sym.split("::")[-1])
+
+        doc_funcs = set(audit_state.get("documented_functions", [])) - in_flight_raw
+        discovered_funcs = audit_state.get("discovered_functions", [])
+        covered_funcs = [
+            f for f in discovered_funcs
+            if (f in doc_funcs or f.split("::")[-1] in doc_funcs) and f not in in_flight_raw and f.split("::")[-1] not in in_flight_raw
+        ]
+        in_flight_funcs = [
+            f for f in discovered_funcs
+            if f in in_flight_raw or f.split("::")[-1] in in_flight_raw
+        ]
+        for sym in sorted(in_flight_raw):
+            if sym not in in_flight_funcs and not any(f.endswith("::" + sym) for f in in_flight_funcs):
+                in_flight_funcs.append(sym)
+
+        remaining_funcs = [
+            f for f in discovered_funcs
+            if f not in covered_funcs and f not in in_flight_funcs
+        ]
+
+        target_files = audit_state.get("target_files", [])
+        documented_files = set(audit_state.get("documented_files", []))
+        covered_files = [f for f in target_files if f in documented_files]
+        remaining_files = [f for f in target_files if f not in documented_files]
+
+        module_name = audit_state.get("module_name", "")
+        sections_count = len(_DOCUMENTED_SECTIONS)
+
+        flight_note = f" ({len(in_flight_funcs)} currently under active exploration)" if in_flight_funcs else ""
+        p_lines = [
+            f"**Documentation Progress Ledger for Module '{module_name}' (Live Coverage Status)**:",
+            f"- **Functions Documented / Inspected**: {len(covered_funcs)} / {len(discovered_funcs)} covered{flight_note}",
+        ]
+        if covered_funcs:
+            sample_cov = covered_funcs[:8]
+            cov_str = ", ".join(f"`{f}`" for f in sample_cov)
+            if len(covered_funcs) > 8:
+                cov_str += f" (+{len(covered_funcs) - 8} more already documented/inspected)"
+            p_lines.append(f"  * ALREADY COVERED (DO NOT RE-QUERY): {cov_str}")
+        if in_flight_funcs:
+            sample_flight = in_flight_funcs[:8]
+            flight_str = ", ".join(f"`{f}`" for f in sample_flight)
+            if len(in_flight_funcs) > 8:
+                flight_str += f" (+{len(in_flight_funcs) - 8} more under exploration)"
+            p_lines.append(f"  * CURRENTLY UNDER ACTIVE REVIEW (INSPECT FULL SOURCE CODE IN ACTIVE TOOL RESULTS BELOW): {flight_str}")
+        if remaining_funcs:
+            sample_rem = remaining_funcs[:12]
+            rem_str = ", ".join(f"`{f}`" for f in sample_rem)
+            if len(remaining_funcs) > 12:
+                rem_str += f" (+{len(remaining_funcs) - 12} more remaining)"
+            p_lines.append(f"  * REMAINING TO BE DOCUMENTED (PRIORITIZE): {rem_str}")
+        elif discovered_funcs and not in_flight_funcs:
+            p_lines.append("  * REMAINING TO BE DOCUMENTED: None (all discovered functions inspected/documented)")
+
+        p_lines.append(f"- **Classes Interfaced**: {len(covered_classes)} / {len(target_classes)} covered")
+        if covered_classes:
+            p_lines.append(f"  * ALREADY INTERFACED (DO NOT RE-QUERY): {', '.join(f'`{c}`' for c in covered_classes)}")
+        if remaining_classes:
+            p_lines.append(f"  * REMAINING CLASSES TO INTERFACE: {', '.join(f'`{c}`' for c in remaining_classes)}")
+
+        p_lines.append(f"- **Files Inspected**: {len(covered_files)} / {len(target_files)} covered")
+        if covered_files:
+            p_lines.append(f"  * ALREADY TOUCHED: {', '.join(f'`{f}`' for f in covered_files[:8])}")
+        if remaining_files:
+            p_lines.append(f"  * REMAINING UNINSPECTED FILES: {', '.join(f'`{f}`' for f in remaining_files[:8])}")
+
+        p_lines.append(f"- **Documentation Sections Committed So Far**: {sections_count} sections")
+        progress_section = "\n".join(p_lines) + "\n\n"
+
     doc_lines = []
     if _DOCUMENTED_SECTIONS:
         doc_lines.append(f"**Codebase Documentation Progress ({len(_DOCUMENTED_SECTIONS)} sections already committed to disk - DO NOT DUPLICATE)**:")
@@ -196,9 +288,10 @@ def manage_context_with_summarization(
 
     summary_text = (
         "### Summary of Prior Codebase Exploration & Documentation Progress (Condensed to stay within strict context limit):\n\n"
+        + progress_section
         + ("\n".join(doc_lines) + "\n\n" if doc_lines else "")
         + "### Key Exploration Facts:\n"
-        + ("\n".join(extracted_facts[:15]) if extracted_facts else "Explored files and symbols in current module.")
+        + ("\n".join(extracted_facts[:15]) if extracted_facts else "- Explored files and symbols in current module.")
     )
 
     summary_message = SystemMessage(content=summary_text)
@@ -727,6 +820,16 @@ def message_reducer(existing: List[BaseMessage], update: Any) -> List[BaseMessag
 class ModuleAgentState(TypedDict):
     messages: Annotated[List[BaseMessage], message_reducer]
     module_name: str
+    user_prompt: str
+    target_files: List[str]
+    target_classes: List[str]
+    interfaced_classes: List[str]
+    discovered_functions: List[str]
+    documented_functions: List[str]
+    in_flight_functions: List[str]
+    documented_files: List[str]
+    nudge_count: int
+    max_nudges: int
     append_called: bool
     append_count: int
     uncommitted_explorations: int
@@ -749,7 +852,8 @@ def build_module_documenter_runner(
         trimmed_messages = manage_context_with_summarization(
             state["messages"],
             max_tokens=max_context_tokens,
-            summarize_threshold=summarize_threshold
+            summarize_threshold=summarize_threshold,
+            audit_state=state
         )
         print_context_banner(trimmed_messages, max_tokens=max_context_tokens, stage="Agent LLM Invocation")
 
@@ -788,52 +892,259 @@ def build_module_documenter_runner(
             if txt:
                 console.print(f"  [dim]Agent: {escape(txt[:100])}...[/dim]")
 
+        # Any in-flight functions that were inspected in this turn now graduate to documented_functions
+        in_flight_done = set(state.get("in_flight_functions", []))
+        new_documented = sorted(list(set(state.get("documented_functions", [])).union(in_flight_done)))
+
         # If summarization replaced/condensed earlier turns, use ("override", ...) to update state messages
         if len(trimmed_messages) != len(state["messages"]):
-            return {"messages": ("override", trimmed_messages + [response])}
-        return {"messages": [response]}
+            return {
+                "messages": ("override", trimmed_messages + [response]),
+                "documented_functions": new_documented,
+                "in_flight_functions": []
+            }
+        return {
+            "messages": [response],
+            "documented_functions": new_documented,
+            "in_flight_functions": []
+        }
 
     def route_module_agent_step(state: ModuleAgentState) -> str:
         last_msg = state["messages"][-1]
 
-        # 1. Did the agent invoke append_documentation_section?
+        # 1. Did the agent invoke any tools?
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
             has_append = any(tc.get("name") == "append_documentation_section" for tc in last_msg.tool_calls)
-            if has_append:
-                return "execute_append"
-
-            # Agent wants to run exploration tools (read_project_file, clangd_query, ripgrep_search)
             uncommitted = state.get("uncommitted_explorations", 0)
-            if uncommitted >= 2:
-                # Enforce documenting what was just explored before reading further files
+            if uncommitted >= 2 and not has_append:
                 return "enforce_append_now"
 
             return "tools"
 
         # 2. No tool calls:
-        if state.get("append_called", False):
+        target_classes = state.get("target_classes", [])
+        interfaced_classes = set(state.get("interfaced_classes", []))
+        remaining_classes = [c for c in target_classes if c not in interfaced_classes]
+
+        documented_funcs = set(state.get("documented_functions", []))
+        discovered_funcs = state.get("discovered_functions", [])
+        remaining_funcs = [
+            f for f in discovered_funcs
+            if f not in documented_funcs and f.split("::")[-1] not in documented_funcs
+        ]
+
+        target_files = state.get("target_files", [])
+        documented_files = set(state.get("documented_files", []))
+        remaining_files = [f for f in target_files if f not in documented_files]
+
+        nudge_count = state.get("nudge_count", 0)
+        max_nudges = state.get("max_nudges", 15)
+
+        is_incomplete = bool(remaining_classes or remaining_funcs or remaining_files)
+
+        if is_incomplete and nudge_count < max_nudges:
+            return "enforce_documentation"
+
+        # If ledger is complete (or max_nudges reached):
+        if state.get("append_called", False) or state.get("append_count", 0) > 0:
             return END
 
         txt = extract_message_text(last_msg)
-        # Only commit directly if it is ACTUAL comprehensive documentation
         if is_substantive_documentation(txt):
             return "commit_text_as_section"
 
-        # If it's a transitional statement ("Now I will compile...") or intermediate thought:
         reminders = state.get("reminder_count", 0)
-        if reminders < 1:
+        if reminders < 1 and nudge_count == 0:
             return "remind_to_append"
         else:
-            # Reached end of exploration or repeated conversational text -> trigger synthesis!
             return "synthesize_and_append"
 
-    exploration_tool_node = ToolNode(EXPLORATION_TOOLS, handle_tool_errors=True)
+    def execute_documenter_tools_node(state: ModuleAgentState) -> Dict[str, Any]:
+        messages = state.get("messages", [])
+        if not messages:
+            return {}
 
-    def execute_exploration_tools_node(state: ModuleAgentState) -> Dict[str, Any]:
-        res = exploration_tool_node.invoke(state)
+        last_msg = messages[-1]
+        if not isinstance(last_msg, AIMessage) or not getattr(last_msg, "tool_calls", None):
+            return {}
+
+        tool_map = {t.name: t for t in DOCUMENTER_TOOLS}
+        tool_messages = []
+
+        new_interfaced = set()
+        new_discovered_funcs = set()
+        new_documented_funcs = set()
+        new_in_flight_funcs = set()
+        new_documented_files = set()
+
+        target_files = state.get("target_files", [])
+        mod = state.get("module_name", "Module")
+        prior_appends = state.get("append_count", 0)
+        appends_in_this_step = 0
+
+        for tc in last_msg.tool_calls:
+            t_name = tc.get("name", "")
+            t_args = dict(tc.get("args", {}))
+            t_id = tc.get("id", f"call_{time.time()}")
+
+            if t_name == "append_documentation_section":
+                total_appends = prior_appends + appends_in_this_step
+                if total_appends > 0 and t_args.get("level", 2) <= 2:
+                    t_args["level"] = 3
+                try:
+                    res_str = append_documentation_section.invoke(t_args)
+                except Exception as e:
+                    res_str = f"Error executing append_documentation_section: {e}"
+                appends_in_this_step += 1
+                tool_messages.append(ToolMessage(
+                    content=(
+                        f"{res_str}\n"
+                        f"[Next Step: You can continue exploring and documenting other files or subsystems in module '{mod}' "
+                        f"by calling 'read_project_file', 'clangd_query', or 'append_documentation_section'. When all files/components in '{mod}' "
+                        f"have been documented, reply stating that documentation for this module is complete (with no further tool calls).]"
+                    ),
+                    tool_call_id=t_id,
+                    name="append_documentation_section"
+                ))
+            else:
+                tool_obj = tool_map.get(t_name)
+                if tool_obj:
+                    try:
+                        raw_res = tool_obj.invoke(t_args)
+                    except Exception as e:
+                        raw_res = f"Error executing tool '{t_name}': {e}"
+                else:
+                    raw_res = f"Error: Tool '{t_name}' not recognized."
+
+                res_str = str(raw_res)
+                tool_messages.append(ToolMessage(content=res_str, tool_call_id=t_id, name=t_name))
+
+                # Check touched files in output
+                touched = extract_touched_files(res_str, target_files)
+                new_documented_files.update(touched)
+
+                if t_name == "clangd_query":
+                    cmd = t_args.get("command", "show")
+                    sym = t_args.get("symbol_or_query") or t_args.get("symbol") or t_args.get("query") or ""
+                    if cmd == "interface":
+                        if sym:
+                            clean_sym = sym.split("::")[-1]
+                            new_interfaced.add(sym)
+                            new_interfaced.add(clean_sym)
+                        parsed_methods = parse_interface_methods(res_str, default_class=sym)
+                        for item in parsed_methods:
+                            new_discovered_funcs.add(item["full_symbol"])
+                            if item["is_trivial"]:
+                                new_documented_funcs.add(item["full_symbol"])
+                                new_documented_funcs.add(item["method_name"])
+                    elif cmd == "show":
+                        if sym:
+                            new_in_flight_funcs.add(sym)
+                            short_sym = sym.split("::")[-1]
+                            new_in_flight_funcs.add(short_sym)
+                            for df in state.get("discovered_functions", []):
+                                if df == sym or df.endswith("::" + short_sym) or df == short_sym:
+                                    new_in_flight_funcs.add(df)
+                    elif cmd == "usages":
+                        pass
+                elif t_name == "read_project_file":
+                    fp = t_args.get("file_path") or t_args.get("path") or t_args.get("filename") or ""
+                    if fp:
+                        new_documented_files.add(fp)
+                        for df in state.get("discovered_functions", []):
+                            if fp in df or Path(fp).stem in df:
+                                new_in_flight_funcs.add(df)
+
+        updated_interfaced = sorted(list(set(state.get("interfaced_classes", [])).union(new_interfaced)))
+        updated_discovered = sorted(list(set(state.get("discovered_functions", [])).union(new_discovered_funcs)))
+        updated_documented = sorted(list(set(state.get("documented_functions", [])).union(new_documented_funcs)))
+        updated_files = sorted(list(set(state.get("documented_files", [])).union(new_documented_files)))
+        current_in_flight = sorted(list(new_in_flight_funcs))
+
+        append_called_now = state.get("append_called", False) or (appends_in_this_step > 0)
+        new_uncommitted = 0 if appends_in_this_step > 0 else (state.get("uncommitted_explorations", 0) + 1)
+
         return {
-            "messages": res.get("messages", []),
-            "uncommitted_explorations": state.get("uncommitted_explorations", 0) + 1
+            "messages": tool_messages,
+            "interfaced_classes": updated_interfaced,
+            "discovered_functions": updated_discovered,
+            "documented_functions": updated_documented,
+            "in_flight_functions": current_in_flight,
+            "documented_files": updated_files,
+            "append_called": append_called_now,
+            "append_count": prior_appends + appends_in_this_step,
+            "uncommitted_explorations": new_uncommitted
+        }
+
+    def enforce_documentation_node(state: ModuleAgentState) -> Dict[str, Any]:
+        module_name = state.get("module_name", "")
+        nudge_count = state.get("nudge_count", 0) + 1
+
+        target_classes = state.get("target_classes", [])
+        interfaced_classes = set(state.get("interfaced_classes", []))
+        remaining_classes = [c for c in target_classes if c not in interfaced_classes]
+
+        documented_funcs = set(state.get("documented_functions", []))
+        discovered_funcs = state.get("discovered_functions", [])
+        remaining_funcs = [
+            f for f in discovered_funcs
+            if f not in documented_funcs and f.split("::")[-1] not in documented_funcs
+        ]
+
+        target_files = state.get("target_files", [])
+        documented_files = set(state.get("documented_files", []))
+        remaining_files = [f for f in target_files if f not in documented_files]
+
+        total_funcs = len(discovered_funcs)
+        audited_count = total_funcs - len(remaining_funcs)
+        total_files = len(target_files)
+        touched_count = len(documented_files)
+        appends_done = state.get("append_count", 0)
+
+        console.print(
+            f"\n  [bold yellow][Documentation Incomplete - Nudge {nudge_count}]: Keeping agent in module '{escape(module_name)}'.[/bold yellow]\n"
+            f"    Progress: {audited_count}/{total_funcs} functions inspected | {touched_count}/{total_files} files touched | {appends_done} sections committed"
+        )
+        if remaining_classes:
+            console.print(f"    Pending classes to interface ({len(remaining_classes)}): {escape(', '.join(remaining_classes[:5]))}")
+        if remaining_funcs:
+            console.print(f"    Pending function implementations ({len(remaining_funcs)}): {escape(', '.join(remaining_funcs[:5]))}...")
+        if remaining_files:
+            console.print(f"    Pending uninspected files ({len(remaining_files)}): {escape(', '.join(remaining_files[:5]))}")
+
+        feedback_lines = [
+            f"DOCUMENTATION ENFORCEMENT NOTICE FOR MODULE '{module_name}':",
+            f"You cannot conclude or proceed to the next module yet. The Python documentation ledger shows required elements in '{module_name}' have NOT been inspected or documented.",
+            f"Current coverage status: {audited_count}/{total_funcs} functions inspected, {touched_count}/{total_files} files inspected, {len(interfaced_classes)}/{len(target_classes)} classes interfaced."
+        ]
+        if remaining_classes:
+            feedback_lines.append(
+                f"- Declared classes/structs not yet interfaced ({len(remaining_classes)} remaining): {', '.join(remaining_classes)}\n"
+                f"  ACTION REQUIRED: Call clangd_query(command='interface', symbol_or_query='{remaining_classes[0]}') to inspect member variables and method signatures."
+            )
+        if remaining_funcs:
+            top_funcs = remaining_funcs[:15]
+            feedback_lines.append(
+                f"- Member/free functions not yet inspected via 'clangd_query(command=\"show\")' ({len(remaining_funcs)} remaining): {', '.join(top_funcs)}"
+            )
+            feedback_lines.append(
+                f"  ACTION REQUIRED: Call clangd_query(command='show', symbol_or_query='{top_funcs[0]}') to inspect its implementation code."
+            )
+        if remaining_files:
+            feedback_lines.append(
+                f"- Uninspected files in module ({len(remaining_files)} remaining): {', '.join(remaining_files[:10])}\n"
+                f"  ACTION REQUIRED: Inspect these files using clangd_query for symbols or read_project_file (if <80 lines)."
+            )
+        feedback_lines.append(
+            "\nIMPORTANT: Document the components incrementally by calling 'append_documentation_section'.\n"
+            "Continue inspecting and documenting the pending items now."
+        )
+
+        nudge_msg = HumanMessage(content="\n".join(feedback_lines))
+        return {
+            "messages": [nudge_msg],
+            "nudge_count": nudge_count,
+            "max_nudges": state.get("max_nudges", 15)
         }
 
     def enforce_append_now_node(state: ModuleAgentState) -> Dict[str, Any]:
@@ -846,54 +1157,6 @@ def build_module_documenter_runner(
         )
         return {
             "messages": [HumanMessage(content=notice)],
-            "uncommitted_explorations": 0
-        }
-
-    def execute_append_node(state: ModuleAgentState) -> Dict[str, Any]:
-        last_msg = state["messages"][-1]
-        tool_messages = []
-        appends_in_this_step = 0
-        mod = state.get("module_name", "Module")
-        prior_appends = state.get("append_count", 0)
-
-        for tc in getattr(last_msg, "tool_calls", []):
-            if tc.get("name") == "append_documentation_section":
-                args = dict(tc.get("args", {}))
-                # Automatic subsection nesting inside module:
-                total_appends = prior_appends + appends_in_this_step
-                if total_appends > 0 and args.get("level", 2) <= 2:
-                    args["level"] = 3
-                try:
-                    res = append_documentation_section.invoke(args)
-                except Exception as e:
-                    res = f"Error executing append_documentation_section: {e}"
-                appends_in_this_step += 1
-                tool_messages.append(ToolMessage(
-                    content=(
-                        f"{res}\n"
-                        f"[Next Step: You can continue exploring and documenting other files or subsystems in module '{mod}' "
-                        f"by calling 'read_project_file' or 'append_documentation_section'. When all files/components in '{mod}' "
-                        f"have been documented, reply stating that documentation for this module is complete (with no further tool calls).]"
-                    ),
-                    tool_call_id=tc.get("id", "append_id"),
-                    name="append_documentation_section"
-                ))
-            else:
-                for t in EXPLORATION_TOOLS:
-                    if t.name == tc.get("name"):
-                        try:
-                            res = t.invoke(tc.get("args", {}))
-                        except Exception as e:
-                            res = f"Error executing tool {t.name}: {e}"
-                        tool_messages.append(ToolMessage(
-                            content=str(res),
-                            tool_call_id=tc.get("id", "tool_id"),
-                            name=t.name
-                        ))
-        return {
-            "messages": tool_messages,
-            "append_called": True,
-            "append_count": prior_appends + appends_in_this_step,
             "uncommitted_explorations": 0
         }
 
@@ -933,7 +1196,8 @@ def build_module_documenter_runner(
         synth_messages = manage_context_with_summarization(
             state["messages"] + [HumanMessage(content=synth_instruction)],
             max_tokens=max_context_tokens,
-            summarize_threshold=summarize_threshold
+            summarize_threshold=summarize_threshold,
+            audit_state=state
         )
         print_context_banner(synth_messages, max_tokens=max_context_tokens, stage="Generating Full Documentation")
 
@@ -995,9 +1259,9 @@ def build_module_documenter_runner(
 
     wf = StateGraph(ModuleAgentState)
     wf.add_node("agent", agent_step)
-    wf.add_node("tools", execute_exploration_tools_node)
+    wf.add_node("tools", execute_documenter_tools_node)
+    wf.add_node("enforce_documentation", enforce_documentation_node)
     wf.add_node("enforce_append_now", enforce_append_now_node)
-    wf.add_node("execute_append", execute_append_node)
     wf.add_node("remind_to_append", remind_to_append_node)
     wf.add_node("synthesize_and_append", synthesize_and_append_node)
     wf.add_node("commit_text_as_section", commit_text_as_section_node)
@@ -1005,18 +1269,18 @@ def build_module_documenter_runner(
     wf.add_edge(START, "agent")
     wf.add_conditional_edges("agent", route_module_agent_step, {
         "tools": "tools",
+        "enforce_documentation": "enforce_documentation",
         "enforce_append_now": "enforce_append_now",
-        "execute_append": "execute_append",
         "remind_to_append": "remind_to_append",
         "synthesize_and_append": "synthesize_and_append",
         "commit_text_as_section": "commit_text_as_section",
         END: END
     })
     wf.add_edge("tools", "agent")
+    wf.add_edge("enforce_documentation", "agent")
     wf.add_edge("enforce_append_now", "agent")
     wf.add_edge("remind_to_append", "agent")
     wf.add_edge("synthesize_and_append", END)
-    wf.add_edge("execute_append", "agent")
     wf.add_edge("commit_text_as_section", END)
 
     return wf.compile()
@@ -1127,12 +1391,27 @@ def document_module_node_factory(
             f"Begin by inspecting the first class or structure using 'clangd_query' or 'read_project_file'."
         )
 
+        proj_path = get_active_project_dir()
+        initial_module_funcs = discover_module_functions(proj_path, files)
+
+        calculated_max_nudges = min(15, max(1, (module_max_steps - 3) // 2))
+
         sub_state: ModuleAgentState = {
             "messages": [
                 SystemMessage(content=DOCUMENTER_SYSTEM_PROMPT),
                 HumanMessage(content=prompt)
             ],
             "module_name": current_module,
+            "user_prompt": user_prompt,
+            "target_files": sorted(files),
+            "target_classes": sorted(mod_classes),
+            "interfaced_classes": [],
+            "discovered_functions": sorted(initial_module_funcs),
+            "documented_functions": [],
+            "in_flight_functions": [],
+            "documented_files": [],
+            "nudge_count": 0,
+            "max_nudges": calculated_max_nudges,
             "append_called": False,
             "append_count": 0,
             "uncommitted_explorations": 0,
@@ -1146,6 +1425,9 @@ def document_module_node_factory(
                 for node_name, node_update in step.items():
                     if node_name == "agent":
                         # Context size banner and tool calls are displayed in agent_step
+                        pass
+                    elif node_name == "enforce_documentation":
+                        # Progress scorecard banner is printed directly inside enforce_documentation_node
                         pass
                     elif node_name == "tools":
                         for msg in node_update.get("messages", []):
