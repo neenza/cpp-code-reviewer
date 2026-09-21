@@ -85,18 +85,29 @@ def partition_messages_safely(
 ) -> tuple:
     """
     Safely partition messages into older history (to summarize) and recent turns (to preserve intact),
-    guaranteeing that AIMessages with tool calls and their corresponding ToolMessages are never separated.
+    guaranteeing that AIMessages with tool calls and their corresponding ToolMessages are never separated,
+    and never dropping active ToolMessages into older history before they are evaluated.
     """
     if len(messages) <= target_recent_count:
         return [], messages
 
     split_idx = len(messages) - target_recent_count
 
-    while split_idx < len(messages) and isinstance(messages[split_idx], ToolMessage):
-        split_idx += 1
-
-    while split_idx > 0 and isinstance(messages[split_idx - 1], AIMessage) and getattr(messages[split_idx - 1], "tool_calls", None):
-        split_idx -= 1
+    # Move split_idx backwards so that an AIMessage with tool_calls and all its ToolMessages
+    # are kept together in recent, never severed across older and recent.
+    while split_idx > 0:
+        # If split_idx points to a ToolMessage, its parent AIMessage is before it.
+        # Shift back so the parent AIMessage is in recent.
+        if isinstance(messages[split_idx], ToolMessage):
+            split_idx -= 1
+            continue
+        # If the message immediately preceding split_idx is an AIMessage with tool_calls,
+        # its ToolMessages would be in recent (at or after split_idx).
+        # Shift back so the AIMessage is in recent with its ToolMessages.
+        if isinstance(messages[split_idx - 1], AIMessage) and getattr(messages[split_idx - 1], "tool_calls", None):
+            split_idx -= 1
+            continue
+        break
 
     older = messages[:split_idx]
     recent = messages[split_idx:]
@@ -168,15 +179,34 @@ def manage_context_with_summarization(
         remaining_classes = [c for c in target_classes if c not in interfaced_classes]
         covered_classes = [c for c in target_classes if c in interfaced_classes]
 
-        audited_funcs = set(audit_state.get("audited_functions", []))
+        in_flight_raw = set(audit_state.get("in_flight_functions", []))
+        # Dynamically discover any symbols actively queried in recent_active_turns
+        for m in recent_active_turns:
+            if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+                for tc in m.tool_calls:
+                    if tc.get("name") == "clangd_query" and tc.get("args", {}).get("command") == "show":
+                        sym = tc.get("args", {}).get("symbol_or_query") or tc.get("args", {}).get("symbol") or ""
+                        if sym:
+                            in_flight_raw.add(sym)
+                            in_flight_raw.add(sym.split("::")[-1])
+
+        audited_funcs = set(audit_state.get("audited_functions", [])) - in_flight_raw
         discovered_funcs = audit_state.get("discovered_functions", [])
         covered_funcs = [
             f for f in discovered_funcs
-            if f in audited_funcs or f.split("::")[-1] in audited_funcs
+            if (f in audited_funcs or f.split("::")[-1] in audited_funcs) and f not in in_flight_raw and f.split("::")[-1] not in in_flight_raw
         ]
+        in_flight_funcs = [
+            f for f in discovered_funcs
+            if f in in_flight_raw or f.split("::")[-1] in in_flight_raw
+        ]
+        for sym in sorted(in_flight_raw):
+            if sym not in in_flight_funcs and not any(f.endswith("::" + sym) for f in in_flight_funcs):
+                in_flight_funcs.append(sym)
+
         remaining_funcs = [
             f for f in discovered_funcs
-            if f not in audited_funcs and f.split("::")[-1] not in audited_funcs
+            if f not in covered_funcs and f not in in_flight_funcs
         ]
 
         target_files = audit_state.get("target_files", [])
@@ -188,9 +218,10 @@ def manage_context_with_summarization(
         global _RECORDED_FINDINGS
         findings_count = len(_RECORDED_FINDINGS)
 
+        flight_note = f" ({len(in_flight_funcs)} currently under active review)" if in_flight_funcs else ""
         p_lines = [
             f"**Audit Progress Ledger for Module '{module_name}' (Live Coverage Status)**:",
-            f"- **Functions Audited**: {len(covered_funcs)} / {len(discovered_funcs)} covered",
+            f"- **Functions Audited**: {len(covered_funcs)} / {len(discovered_funcs)} covered{flight_note}",
         ]
         if covered_funcs:
             sample_cov = covered_funcs[:8]
@@ -198,13 +229,19 @@ def manage_context_with_summarization(
             if len(covered_funcs) > 8:
                 cov_str += f" (+{len(covered_funcs) - 8} more already reviewed)"
             p_lines.append(f"  * ALREADY COVERED (DO NOT RE-AUDIT): {cov_str}")
+        if in_flight_funcs:
+            sample_flight = in_flight_funcs[:8]
+            flight_str = ", ".join(f"`{f}`" for f in sample_flight)
+            if len(in_flight_funcs) > 8:
+                flight_str += f" (+{len(in_flight_funcs) - 8} more under review)"
+            p_lines.append(f"  * CURRENTLY UNDER ACTIVE REVIEW (INSPECT FULL SOURCE CODE IN ACTIVE TOOL RESULTS BELOW): {flight_str}")
         if remaining_funcs:
             sample_rem = remaining_funcs[:12]
             rem_str = ", ".join(f"`{f}`" for f in sample_rem)
             if len(remaining_funcs) > 12:
                 rem_str += f" (+{len(remaining_funcs) - 12} more remaining)"
             p_lines.append(f"  * REMAINING TO BE AUDITED (PRIORITIZE): {rem_str}")
-        elif discovered_funcs:
+        elif discovered_funcs and not in_flight_funcs:
             p_lines.append("  * REMAINING TO BE AUDITED: None (all discovered functions audited)")
 
         p_lines.append(f"- **Classes Interfaced**: {len(covered_classes)} / {len(target_classes)} covered")
@@ -257,6 +294,7 @@ class ModuleReviewState(TypedDict):
     interfaced_classes: List[str]
     discovered_functions: List[str]
     audited_functions: List[str]
+    in_flight_functions: List[str]
     audited_files: List[str]
     nudge_count: int
     findings_at_start: int
@@ -507,6 +545,7 @@ def audit_tools_node(state: ModuleReviewState) -> Dict[str, Any]:
     new_interfaced = set()
     new_discovered_funcs = set()
     new_audited_funcs = set()
+    new_in_flight_funcs = set()
     new_audited_files = set()
 
     target_files = state.get("target_files", [])
@@ -548,12 +587,12 @@ def audit_tools_node(state: ModuleReviewState) -> Dict[str, Any]:
                         new_audited_funcs.add(item["method_name"])
             elif cmd == "show":
                 if sym:
-                    new_audited_funcs.add(sym)
+                    new_in_flight_funcs.add(sym)
                     short_sym = sym.split("::")[-1]
-                    new_audited_funcs.add(short_sym)
+                    new_in_flight_funcs.add(short_sym)
                     for df in state.get("discovered_functions", []):
                         if df == sym or df.endswith("::" + short_sym) or df == short_sym:
-                            new_audited_funcs.add(df)
+                            new_in_flight_funcs.add(df)
             elif cmd == "usages":
                 pass
         elif t_name == "read_project_file":
@@ -562,18 +601,20 @@ def audit_tools_node(state: ModuleReviewState) -> Dict[str, Any]:
                 new_audited_files.add(fp)
                 for df in state.get("discovered_functions", []):
                     if fp in df or Path(fp).stem in df:
-                        new_audited_funcs.add(df)
+                        new_in_flight_funcs.add(df)
 
     updated_interfaced = sorted(list(set(state.get("interfaced_classes", [])).union(new_interfaced)))
     updated_discovered = sorted(list(set(state.get("discovered_functions", [])).union(new_discovered_funcs)))
     updated_audited = sorted(list(set(state.get("audited_functions", [])).union(new_audited_funcs)))
     updated_files = sorted(list(set(state.get("audited_files", [])).union(new_audited_files)))
+    current_in_flight = sorted(list(new_in_flight_funcs))
 
     return {
         "messages": tool_messages,
         "interfaced_classes": updated_interfaced,
         "discovered_functions": updated_discovered,
         "audited_functions": updated_audited,
+        "in_flight_functions": current_in_flight,
         "audited_files": updated_files
     }
 
@@ -760,10 +801,22 @@ def build_module_reviewer(
             if txt:
                 console.print(f"  [dim]Agent: {escape(txt[:100])}...[/dim]")
 
+        # Any in-flight functions that were inspected in this turn now graduate to audited_functions
+        in_flight_done = set(state.get("in_flight_functions", []))
+        new_audited = sorted(list(set(state.get("audited_functions", [])).union(in_flight_done)))
+
         # If summarization replaced/condensed earlier turns, use ("override", ...) to update state messages
         if len(trimmed_messages) != len(state["messages"]):
-            return {"messages": ("override", trimmed_messages + [response])}
-        return {"messages": [response]}
+            return {
+                "messages": ("override", trimmed_messages + [response]),
+                "audited_functions": new_audited,
+                "in_flight_functions": []
+            }
+        return {
+            "messages": [response],
+            "audited_functions": new_audited,
+            "in_flight_functions": []
+        }
 
     wf = StateGraph(ModuleReviewState)
     wf.add_node("agent", agent_step)
@@ -863,6 +916,7 @@ def review_module_node_factory(
             "interfaced_classes": [],
             "discovered_functions": sorted(initial_module_funcs),
             "audited_functions": [],
+            "in_flight_functions": [],
             "audited_files": [],
             "nudge_count": 0,
             "findings_at_start": len(_RECORDED_FINDINGS),

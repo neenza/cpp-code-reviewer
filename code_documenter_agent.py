@@ -85,21 +85,29 @@ def partition_messages_safely(
 ) -> tuple:
     """
     Safely partition messages into older history (to summarize) and recent turns (to preserve intact),
-    guaranteeing that AIMessages with tool calls and their corresponding ToolMessages are never separated.
+    guaranteeing that AIMessages with tool calls and their corresponding ToolMessages are never separated,
+    and never dropping active ToolMessages into older history before they are evaluated.
     """
     if len(messages) <= target_recent_count:
         return [], messages
 
     split_idx = len(messages) - target_recent_count
 
-    # 1. Advance split_idx forward past any contiguous ToolMessages so we don't start recent_turns with an orphan ToolMessage
-    while split_idx < len(messages) and isinstance(messages[split_idx], ToolMessage):
-        split_idx += 1
-
-    # 2. If the message immediately preceding split_idx was an AIMessage with tool_calls,
-    # move split_idx back before that AIMessage so its tool call and response remain together.
-    while split_idx > 0 and isinstance(messages[split_idx - 1], AIMessage) and getattr(messages[split_idx - 1], "tool_calls", None):
-        split_idx -= 1
+    # Move split_idx backwards so that an AIMessage with tool_calls and all its ToolMessages
+    # are kept together in recent, never severed across older and recent.
+    while split_idx > 0:
+        # If split_idx points to a ToolMessage, its parent AIMessage is before it.
+        # Shift back so the parent AIMessage is in recent.
+        if isinstance(messages[split_idx], ToolMessage):
+            split_idx -= 1
+            continue
+        # If the message immediately preceding split_idx is an AIMessage with tool_calls,
+        # its ToolMessages would be in recent (at or after split_idx).
+        # Shift back so the AIMessage is in recent with its ToolMessages.
+        if isinstance(messages[split_idx - 1], AIMessage) and getattr(messages[split_idx - 1], "tool_calls", None):
+            split_idx -= 1
+            continue
+        break
 
     older = messages[:split_idx]
     recent = messages[split_idx:]

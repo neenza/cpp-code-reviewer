@@ -546,8 +546,120 @@ From src/order_repository.cpp:6:23 (definition)
         self.assertIn("REMAINING UNINSPECTED FILES", summary_content)
         self.assertIn("src/payment_processor.cpp", summary_content)
 
+    def test_partition_messages_safely_keeps_all_trailing_tool_messages_intact(self):
+        from code_review_agent import partition_messages_safely
+        from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+
+        # Scenario: agent emitted 4 tool calls; all 4 ToolMessages are at the tail of messages
+        m0 = HumanMessage(content="Audit the module")
+        m1 = AIMessage(content="Older note")
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "sym1"}, "id": "tc1"},
+                {"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "sym2"}, "id": "tc2"},
+                {"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "sym3"}, "id": "tc3"},
+                {"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "sym4"}, "id": "tc4"},
+            ]
+        )
+        t1 = ToolMessage(content="void sym1() { /* body */ }", tool_call_id="tc1", name="clangd_query")
+        t2 = ToolMessage(content="void sym2() { /* body */ }", tool_call_id="tc2", name="clangd_query")
+        t3 = ToolMessage(content="void sym3() { /* body */ }", tool_call_id="tc3", name="clangd_query")
+        t4 = ToolMessage(content="void sym4() { /* body */ }", tool_call_id="tc4", name="clangd_query")
+
+        messages = [m0, m1, ai_msg, t1, t2, t3, t4]
+
+        older, recent = partition_messages_safely(messages, target_recent_count=2)
+        # Recent MUST contain ai_msg and all 4 ToolMessages, NEVER empty
+        self.assertEqual(len(recent), 5)
+        self.assertIs(recent[0], ai_msg)
+        self.assertIs(recent[1], t1)
+        self.assertIs(recent[2], t2)
+        self.assertIs(recent[3], t3)
+        self.assertIs(recent[4], t4)
+        # Older should contain only m0, m1
+        self.assertEqual(len(older), 2)
+        self.assertIs(older[0], m0)
+        self.assertIs(older[1], m1)
+
+    def test_in_flight_functions_not_marked_as_covered_during_summarization(self):
+        from code_review_agent import manage_context_with_summarization
+        from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+
+        # Scenario: LLM just requested 3 symbols, and the tools returned large outputs crossing context limit
+        sys_msg = SystemMessage(content="System prompt")
+        user_msg = HumanMessage(content="Review module")
+        older_ai = AIMessage(content="I previously inspected the class interface and found methods.")
+        ai_req = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "SessionManager::create_session"}, "id": "c1"},
+                {"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "SessionManager::invalidate_session"}, "id": "c2"},
+                {"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "SessionManager::get_session"}, "id": "c3"},
+            ]
+        )
+        # Large bodies that push tokens past threshold
+        t1 = ToolMessage(content="Session create_session() {\n" + "    // code\n" * 200 + "}", tool_call_id="c1", name="clangd_query")
+        t2 = ToolMessage(content="void invalidate_session() {\n" + "    // code\n" * 200 + "}", tool_call_id="c2", name="clangd_query")
+        t3 = ToolMessage(content="Session* get_session() {\n" + "    // code\n" * 200 + "}", tool_call_id="c3", name="clangd_query")
+
+        messages = [sys_msg, user_msg, older_ai, ai_req, t1, t2, t3]
+
+        audit_state = {
+            "module_name": "src",
+            "target_classes": ["SessionManager"],
+            "interfaced_classes": ["SessionManager"],
+            "discovered_functions": [
+                "SessionManager::create_session",
+                "SessionManager::invalidate_session",
+                "SessionManager::get_session",
+                "SessionManager::cleanup_all"
+            ],
+            "audited_functions": [],  # NOT audited yet!
+            "in_flight_functions": [
+                "SessionManager::create_session",
+                "SessionManager::invalidate_session",
+                "SessionManager::get_session"
+            ],
+            "target_files": ["src/session_manager.cpp"],
+            "audited_files": []
+        }
+
+        trimmed = manage_context_with_summarization(
+            messages,
+            max_tokens=2500,
+            reserve_tokens=300,
+            summarize_threshold=1000,
+            audit_state=audit_state
+        )
+
+        summary_msg = trimmed[2]
+        content = summary_msg.content
+
+        # 1. Must NOT be marked as ALREADY COVERED (DO NOT RE-AUDIT)
+        self.assertNotIn("ALREADY COVERED (DO NOT RE-AUDIT): `SessionManager::create_session`", content)
+        self.assertNotIn("ALREADY COVERED (DO NOT RE-AUDIT): `SessionManager::invalidate_session`", content)
+        self.assertNotIn("ALREADY COVERED (DO NOT RE-AUDIT): `SessionManager::get_session`", content)
+
+        # 2. Must be explicitly flagged as CURRENTLY UNDER ACTIVE REVIEW
+        self.assertIn("CURRENTLY UNDER ACTIVE REVIEW", content)
+        self.assertIn("SessionManager::create_session", content)
+        self.assertIn("SessionManager::invalidate_session", content)
+        self.assertIn("SessionManager::get_session", content)
+
+        # 3. Remaining unqueried functions still prioritized
+        self.assertIn("REMAINING TO BE AUDITED (PRIORITIZE)", content)
+        self.assertIn("SessionManager::cleanup_all", content)
+
+        # 4. Active tool messages must be preserved intact in recent_active_turns
+        self.assertIn(t1, trimmed)
+        self.assertIn(t2, trimmed)
+        self.assertIn(t3, trimmed)
+        self.assertIn(ai_req, trimmed)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
