@@ -9,6 +9,8 @@ from cpp_agent_tools import (
     ripgrep_search,
     read_project_file,
     set_active_project_dir,
+    set_require_permission,
+    set_permission_callback,
     COMMON_CPP_TOOLS
 )
 
@@ -39,6 +41,16 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
     def setUpClass(cls):
         cls.sample_dir = Path(__file__).parent / "sample_project"
         set_active_project_dir(cls.sample_dir)
+
+    def setUp(self):
+        set_active_project_dir(self.sample_dir)
+        set_permission_callback(None)
+        set_require_permission(False)
+
+    def tearDown(self):
+        set_active_project_dir(self.sample_dir)
+        set_permission_callback(None)
+        set_require_permission(False)
 
     def test_read_cmakelists(self):
         content = read_project_file.invoke({"file_path": "CMakeLists.txt"})
@@ -805,6 +817,222 @@ From src/order_repository.cpp:6:23 (definition)
         # Active tool message preserved in full fidelity
         self.assertIn(large_tool, trimmed)
         self.assertIn(ai_req, trimmed)
+
+    def test_write_project_file_permission(self):
+        from cpp_agent_tools import (
+            write_project_file,
+            set_active_project_dir,
+            set_require_permission,
+            set_permission_callback
+        )
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+
+            # 1. Test permission DENIED
+            set_require_permission(True)
+            set_permission_callback(lambda prompt: False)
+            res_denied = write_project_file.invoke({
+                "file_path": "new_file.txt",
+                "content": "Hello World"
+            })
+            self.assertIn("Permission Denied", res_denied)
+            self.assertFalse((tmp_path / "new_file.txt").exists())
+
+            # 2. Test permission GRANTED
+            set_permission_callback(lambda prompt: True)
+            res_granted = write_project_file.invoke({
+                "file_path": "nested/dir/new_file.txt",
+                "content": "Hello from granted permission"
+            })
+            self.assertIn("Successfully created file", res_granted)
+            created_file = tmp_path / "nested/dir/new_file.txt"
+            self.assertTrue(created_file.exists())
+            self.assertEqual(created_file.read_text(encoding="utf-8"), "Hello from granted permission")
+
+            # Clean up callback
+            set_permission_callback(None)
+            set_require_permission(True)
+
+    def test_edit_project_file_permission_and_patches(self):
+        from cpp_agent_tools import (
+            edit_project_file,
+            set_active_project_dir,
+            set_require_permission,
+            set_permission_callback
+        )
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+
+            sample_file = tmp_path / "calc.cpp"
+            sample_file.write_text(
+                "int add(int a, int b) {\n"
+                "    return a + b;\n"
+                "}\n\n"
+                "int multiply(int a, int b) {\n"
+                "    return a * b;\n"
+                "}\n",
+                encoding="utf-8"
+            )
+
+            # 1. Test permission DENIED
+            set_require_permission(True)
+            set_permission_callback(lambda prompt: False)
+            res_denied = edit_project_file.invoke({
+                "file_path": "calc.cpp",
+                "target_content": "return a + b;",
+                "replacement_content": "return a + b + 0;"
+            })
+            self.assertIn("Permission Denied", res_denied)
+            self.assertIn("return a + b;", sample_file.read_text(encoding="utf-8"))
+
+            # 2. Test permission GRANTED - successful surgical patch
+            set_permission_callback(lambda prompt: True)
+            res_granted = edit_project_file.invoke({
+                "file_path": "calc.cpp",
+                "target_content": "    return a + b;\n",
+                "replacement_content": "    // add with bounds checking\n    return a + b;\n"
+            })
+            self.assertIn("Successfully applied patch", res_granted)
+            content = sample_file.read_text(encoding="utf-8")
+            self.assertIn("// add with bounds checking", content)
+
+            # 3. Test target not found error
+            res_not_found = edit_project_file.invoke({
+                "file_path": "calc.cpp",
+                "target_content": "non_existent_code();",
+                "replacement_content": "something_else();"
+            })
+            self.assertIn("Error: target_content not found", res_not_found)
+
+            # 4. Test multiple matches rejected when allow_multiple=False
+            res_multiple = edit_project_file.invoke({
+                "file_path": "calc.cpp",
+                "target_content": "int a, int b",
+                "replacement_content": "int x, int y",
+                "allow_multiple": False
+            })
+            self.assertIn("matched 2 times", res_multiple)
+
+            set_permission_callback(None)
+
+    def test_execute_shell_command_permission(self):
+        from cpp_agent_tools import (
+            execute_shell_command,
+            set_active_project_dir,
+            set_require_permission,
+            set_permission_callback
+        )
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_active_project_dir(Path(tmpdir))
+
+            # 1. Permission Denied
+            set_require_permission(True)
+            set_permission_callback(lambda prompt: False)
+            res_denied = execute_shell_command.invoke({
+                "command": "echo 'Testing 123'"
+            })
+            self.assertIn("Permission Denied", res_denied)
+
+            # 2. Permission Granted
+            set_permission_callback(lambda prompt: True)
+            res_granted = execute_shell_command.invoke({
+                "command": "echo 'Hello Shell Tool'"
+            })
+            self.assertIn("Exit code: 0", res_granted)
+            self.assertIn("Hello Shell Tool", res_granted)
+
+            set_permission_callback(None)
+
+    def test_coding_assistant_manage_context_summarization(self):
+        from coding_assistant_agent import manage_context_with_summarization
+        from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+
+        class MockSummarizerLLM:
+            def invoke(self, messages):
+                return AIMessage(content="Summarized technical context: Refactored database logic and inspected models.")
+
+        sys_msg = SystemMessage(content="System coding prompt")
+        user_msg = HumanMessage(content="Please refactor session storage")
+        older_turn_0 = AIMessage(content="I will check repository structure.")
+        older_turn_1 = AIMessage(
+            content="",
+            tool_calls=[{"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "SessionManager"}, "id": "call_1"}]
+        )
+        older_tool_1 = ToolMessage(content="class SessionManager { ... 500 lines ... }", tool_call_id="call_1", name="clangd_query")
+        older_turn_2 = AIMessage(content="Now reviewing session implementation.")
+        recent_ai = AIMessage(
+            content="",
+            tool_calls=[{"name": "edit_project_file", "args": {"file_path": "src/session.cpp"}, "id": "call_2"}]
+        )
+        recent_tool = ToolMessage(content="Successfully applied patch", tool_call_id="call_2", name="edit_project_file")
+
+        messages = [sys_msg, user_msg, older_turn_0, older_turn_1, older_tool_1, older_turn_2, recent_ai, recent_tool]
+
+        # Trigger summarization with low threshold
+        summarized = manage_context_with_summarization(
+            messages,
+            llm=MockSummarizerLLM(),
+            max_tokens=2000,
+            reserve_tokens=200,
+            summarize_threshold=50
+        )
+
+        self.assertLess(len(summarized), len(messages))
+        summary_content = summarized[1].content
+        self.assertIn("ACTIVE ROLLING CONTEXT SUMMARY", summary_content)
+        self.assertIn("Refactored database logic", summary_content)
+        # Recent active turns preserved intact
+        self.assertIn(recent_ai, summarized)
+        self.assertIn(recent_tool, summarized)
+
+    def test_coding_assistant_graph_execution(self):
+        from coding_assistant_agent import build_coding_assistant_graph
+        from cpp_agent_tools import set_permission_callback, set_require_permission, set_active_project_dir
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+            set_require_permission(True)
+            set_permission_callback(lambda prompt: True)
+
+            class ScriptedCodingLLM:
+                def __init__(self):
+                    self.step = 0
+                def bind_tools(self, tools):
+                    return self
+                def invoke(self, messages):
+                    self.step += 1
+                    if self.step == 1:
+                        return AIMessage(
+                            content="",
+                            tool_calls=[{
+                                "name": "write_project_file",
+                                "args": {"file_path": "greeting.cpp", "content": "#include <iostream>\nint main() { return 0; }\n"},
+                                "id": "tc_write"
+                            }]
+                        )
+                    else:
+                        return AIMessage(content="I have created greeting.cpp and verified the structure.")
+
+            app = build_coding_assistant_graph(llm=ScriptedCodingLLM())
+            initial_state = {
+                "messages": [HumanMessage(content="Create greeting.cpp")]
+            }
+            res = app.invoke(initial_state, {"recursion_limit": 10})
+
+            self.assertTrue((tmp_path / "greeting.cpp").exists())
+            self.assertIn("greeting.cpp and verified", res["messages"][-1].content)
+
+            set_permission_callback(None)
 
 
 if __name__ == "__main__":

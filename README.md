@@ -37,11 +37,30 @@ A modular suite of intelligent C++ engineering agents built with **LangGraph**, 
   - `/help` - Shows command tips.
   - `/exit` or `quit` - Exits the interactive session.
 
-### 4. Shared C++ Tools Module (`cpp_agent_tools.py`)
+### 4. General C++ Coding Assistant Agent (`coding_assistant_agent.py`)
+- **Purpose**: A full-featured general software engineering assistant capable of investigating, creating, patching, refactoring, compiling, and testing code across a C++ project.
+- **AST & Regex Intelligence**: Uses `clangd-query` (`interface`, `show`, `usages`, `hierarchy`) and `ripgrep` (`rg`) to deeply understand code before making any edits.
+- **Surgical File Patching & File Creation**:
+  - `write_project_file`: Creates new files or rewrites full files, automatically generating parent directories.
+  - `edit_project_file`: Performs surgical search-and-replace chunk patching without rewriting whole files, validating exact indentation and whitespace.
+- **Build & Verification Execution**:
+  - `execute_shell_command`: Runs CMake build commands (`cmake --build build`), test suites (`ctest`), formatters, and git checks to verify edits.
+- **Interactive User Permission Protocol**:
+  - Protects the repository by prompting the user for interactive confirmation (`[y/N]`) before applying any file write, chunk patch, or shell command. Displays target files, diff previews, and command details. Supports `--auto-approve` (`-y`) for automated scripting.
+- **Proactive Rolling Context Summarization**:
+  - Dynamically monitors token consumption. When context reaches `--context-summarize-threshold` (default: 12,000 tokens), older turns are safely condensed into a structured technical context brief while keeping active tool calls and recent turns intact.
+- **Dual Operating Modes**:
+  - **Interactive REPL**: Conversational pair programming with rich Markdown output.
+  - **Autonomous Task Mode**: Executes a single-shot prompt passed via `--prompt "..."`.
+
+### 5. Shared C++ Tools Module (`cpp_agent_tools.py`)
 - Centralized reusable toolset powering all C++ agents:
   - **`clangd_query`**: Semantic AST code intelligence (`search`, `show`, `usages`, `hierarchy`, `signature`, `interface`).
-  - **`ripgrep_search`**: High-performance regex text search for memory management keywords (`malloc`, `free`, `new`, `delete`, `strcpy`), concurrency primitives, and raw pointer patterns.
+  - **`ripgrep_search`**: High-performance regex text search for memory management keywords, concurrency primitives, and raw pointer patterns.
   - **`read_project_file`**: Bounded file reader with line-range slicing; protects context budget by capping unconstrained reads of large files (>80 lines) to 60 lines and directing models to semantic AST queries.
+  - **`write_project_file`**: Safe file writing with parent directory creation and interactive user permission validation.
+  - **`edit_project_file`**: Exact chunk search-and-replace patching with diff display and user confirmation.
+  - **`execute_shell_command`**: Project-sandboxed shell execution with timeout handling and user confirmation.
   - **`discover_project_classes` & `group_classes_by_module`**: Project-wide scanning and aggregation of classes/structs.
   - **`list_project_structure`**: Rapid inventory and directory mapping.
   - **`get_llm`**: Multi-model factory supporting local/offline Ollama (`num_ctx` allocation) and Google Gemini.
@@ -52,10 +71,11 @@ A modular suite of intelligent C++ engineering agents built with **LangGraph**, 
 
 ```
 codereviewagent/
-├── cpp_agent_tools.py         # Shared C++ tools (clangd-query, ripgrep, file reader, LLM factory)
+├── cpp_agent_tools.py         # Shared C++ tools (clangd-query, ripgrep, file readers/writers, patcher, shell)
 ├── code_review_agent.py       # Autonomous code review orchestrator (Map-Reduce, context summarizer)
 ├── code_documenter_agent.py   # Autonomous documentation agent (incremental Markdown, 32k context guard)
 ├── code_explainer_agent.py    # Interactive codebase explainer & tutor REPL
+├── coding_assistant_agent.py  # General coding assistant (AST search, file patch/write, shell execution)
 ├── test_agent_tools.py        # Unit test suite verifying tools & agents
 ├── AGENT.md                   # Detailed clangd-query specifications & usage guidelines
 ├── README.md                  # Documentation
@@ -160,6 +180,21 @@ python code_explainer_agent.py --provider gemini --model gemini-3.5-flash-lite -
 python code_explainer_agent.py --provider ollama --model llama3.1:8b --project-dir /path/to/cpp_project
 ```
 
+### Running the General C++ Coding Assistant
+
+```bash
+# Interactive REPL pair programming (prompts for confirmation before file writes/patches/shell commands):
+python coding_assistant_agent.py sample_project --provider gemini --model gemini-2.5-flash
+
+# Autonomous single-shot task:
+python coding_assistant_agent.py sample_project --provider gemini --model gemini-2.5-flash \
+  --prompt "Refactor SessionManager to eliminate strcpy and replace with bounds-checked copy, then run cmake build"
+
+# Auto-approve modifications for headless CI or automated scripts:
+python coding_assistant_agent.py /path/to/cpp_project --auto-approve \
+  --prompt "Format all headers in include/ using clang-format"
+```
+
 ---
 
 ## CLI Options Reference
@@ -167,16 +202,18 @@ python code_explainer_agent.py --provider ollama --model llama3.1:8b --project-d
 | Argument | Short Flag | Applicable Agent(s) | Description | Default |
 |---|---|---|---|---|
 | `--project-dir` | `-p` | All | Path to the target C++ codebase directory | `./sample_project` |
+| `--prompt` | | Assistant | Single-shot task directive. If omitted, starts interactive REPL | `""` (interactive) |
 | `--provider` | | All | LLM provider backend: `gemini`, `google`, or `ollama` | `gemini` |
-| `--model` | `-m` | All | Model name (e.g., `gemini-3.5-flash-lite`, `llama3.1:8b`, `qwen2.5:14b`) | Provider default |
+| `--model` | `-m` | All | Model name (e.g., `gemini-2.5-flash`, `llama3.1:8b`, `qwen2.5:14b`) | Provider default |
 | `--ollama-host` | | All | URL of the local Ollama server | `http://localhost:11434` |
 | `--user-prompt`, `--initial-prompt` | `-u` | Reviewer, Documenter | Initial custom prompt or focus directive guiding the agent's audit or documentation | `""` (none) |
-| `--max-context-tokens` | | Reviewer, Documenter | Maximum context token ceiling allocated and monitored across execution | `32000` (32k) |
-| `--context-summarize-threshold` | | Reviewer, Documenter | Token threshold to proactively trigger rolling summarization of completed turns | `12000` tokens |
+| `--max-context-tokens` | | Reviewer, Documenter, Assistant | Maximum context token ceiling allocated and monitored across execution | `32000` (32k) |
+| `--context-summarize-threshold` | | Reviewer, Documenter, Assistant | Token threshold to proactively trigger rolling summarization of completed turns | `12000` tokens |
+| `--auto-approve`, `--yes` | `-y` | Assistant | Automatically grant permission for file writes, patches, and shell commands without interactive confirmation prompts | `False` |
 | `--output` | `-o` | Reviewer, Documenter | Custom file path for generated Markdown report or documentation | Default filename in project dir |
 | `--target-dirs`, `--include-dirs` | | Documenter | Comma-separated list of folders to document (e.g. `src,include`). Other folders remain accessible for reference | All discovered modules |
 | `--ignore-dirs` | | Reviewer, Documenter | Comma-separated directory names to ignore during planning (e.g. `tests,benchmarks,legacy`) | Standard build/vendor exclusions |
-| `--max-steps` | | All | Maximum recursion execution steps per module exploration | `50` (documenter) / `500` (reviewer) / `60` (explainer) |
+| `--max-steps` | | All | Maximum recursion execution steps per module exploration | `50` (documenter) / `500` (reviewer) / `60` (explainer/assistant) |
 
 ---
 

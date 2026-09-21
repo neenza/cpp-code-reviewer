@@ -18,12 +18,106 @@ from rich.console import Console
 from rich.markup import escape
 
 from langchain_core.tools import tool
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, ToolMessage, BaseMessage
 
 load_dotenv()
 console = Console()
 
+try:
+    import tiktoken
+    _TOKENIZER = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TOKENIZER = None
+
+
+def count_tokens(text: str) -> int:
+    """Estimate or accurately count tokens in a text string."""
+    if not text:
+        return 0
+    if _TOKENIZER:
+        try:
+            return len(_TOKENIZER.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
+
+def count_message_tokens(msg: BaseMessage) -> int:
+    """Calculate token size of a LangChain message including tool calls."""
+    tokens = count_tokens(extract_text(msg.content)) + 4
+    if isinstance(msg, AIMessage) and msg.tool_calls:
+        for tc in msg.tool_calls:
+            tokens += count_tokens(tc.get("name", ""))
+            tokens += count_tokens(json.dumps(tc.get("args", {}))) + 6
+    return tokens
+
+
+def partition_messages_safely(
+    messages: List[BaseMessage],
+    target_recent_count: int = 4
+) -> tuple:
+    """
+    Safely partition messages into older history (to summarize) and recent turns (to preserve intact),
+    guaranteeing that AIMessages with tool calls and their corresponding ToolMessages are never separated.
+    """
+    if len(messages) <= target_recent_count:
+        return [], messages
+
+    split_idx = len(messages) - target_recent_count
+
+    while split_idx > 0:
+        if isinstance(messages[split_idx], ToolMessage):
+            split_idx -= 1
+            continue
+        if isinstance(messages[split_idx - 1], AIMessage) and getattr(messages[split_idx - 1], "tool_calls", None):
+            split_idx -= 1
+            continue
+        break
+
+    older = messages[:split_idx]
+    recent = messages[split_idx:]
+    return older, recent
+
+
 _ACTIVE_PROJECT_DIR: Path = Path.cwd()
+_REQUIRE_PERMISSION: bool = True
+_PERMISSION_CALLBACK: Optional[Any] = None
+
+
+def set_require_permission(val: bool) -> None:
+    """Enable or disable interactive permission checks for file writing, editing, and shell execution."""
+    global _REQUIRE_PERMISSION
+    _REQUIRE_PERMISSION = val
+
+
+def get_require_permission() -> bool:
+    """Check if permission is currently required for destructive actions."""
+    global _REQUIRE_PERMISSION
+    return _REQUIRE_PERMISSION
+
+
+def set_permission_callback(cb: Optional[Any]) -> None:
+    """Set a custom callback function (prompt_text: str) -> bool for permission checks."""
+    global _PERMISSION_CALLBACK
+    _PERMISSION_CALLBACK = cb
+
+
+def ask_user_permission(prompt_text: str) -> bool:
+    """Prompt the user for permission to execute a file modification or shell execution."""
+    global _REQUIRE_PERMISSION, _PERMISSION_CALLBACK
+    if not _REQUIRE_PERMISSION:
+        return True
+    if _PERMISSION_CALLBACK is not None:
+        return bool(_PERMISSION_CALLBACK(prompt_text))
+    try:
+        from rich.prompt import Confirm
+        return Confirm.ask(prompt_text, default=False)
+    except Exception:
+        try:
+            ans = input(f"{prompt_text} [y/N]: ").strip().lower()
+            return ans in ("y", "yes")
+        except EOFError:
+            return False
 
 
 def set_active_project_dir(project_dir: Path) -> None:
@@ -564,12 +658,210 @@ def extract_touched_files(text: str, project_files: List[str]) -> List[str]:
 
 COMMON_CPP_TOOLS = [clangd_query, ripgrep_search, read_project_file, list_project_structure]
 
+
+@tool
+def write_project_file(
+    file_path: str,
+    content: str,
+    overwrite: bool = True
+) -> str:
+    """Write or overwrite a file in the project directory.
+    Prompts the user for interactive permission before modifying the filesystem.
+
+    Args:
+        file_path: Relative path to the file to create or overwrite.
+        content: The text content to write into the file.
+        overwrite: Whether to overwrite the file if it already exists (default True).
+    """
+    global _ACTIVE_PROJECT_DIR
+    if not file_path:
+        return "Error: 'file_path' is required."
+
+    target = (_ACTIVE_PROJECT_DIR / file_path).resolve()
+    if not str(target).startswith(str(_ACTIVE_PROJECT_DIR)):
+        return f"Error: Access denied. Cannot write outside project directory: {file_path}"
+
+    if target.exists() and not overwrite:
+        return f"Error: File '{file_path}' already exists and overwrite is set to False."
+
+    action_str = "overwrite" if target.exists() else "create"
+    lines = content.count("\n") + (1 if content else 0)
+
+    console.print(f"\n  [bold yellow][Permission Request][/bold yellow] Agent requests permission to {action_str} file: [cyan]{escape(file_path)}[/cyan] ({lines} lines, {len(content):,} chars)")
+    prompt_msg = f"Do you allow the agent to {action_str} '{file_path}'?"
+    if not ask_user_permission(prompt_msg):
+        console.print(f"  [bold red][Permission Denied][/bold red] User rejected {action_str} for '{escape(file_path)}'")
+        return f"Permission Denied: User did not grant permission to {action_str} '{file_path}'."
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        console.print(f"  [bold green][OK][/bold green] Successfully wrote '{escape(file_path)}' ({lines} lines)")
+        return f"Successfully {action_str}d file '{file_path}' ({lines} lines, {len(content)} characters)."
+    except Exception as e:
+        return f"Error writing file '{file_path}': {e}"
+
+
+@tool
+def edit_project_file(
+    file_path: str,
+    target_content: str,
+    replacement_content: str,
+    allow_multiple: bool = False
+) -> str:
+    """Perform a precise, surgical search-and-replace edit on an existing file.
+    Prompts the user for interactive permission before applying the patch.
+
+    Args:
+        file_path: Relative path to the file to modify.
+        target_content: The exact string block within the file to replace (must match whitespace and indentation exactly).
+        replacement_content: The new replacement string block.
+        allow_multiple: If True, replaces all occurrences of target_content; if False, errors if target_content appears more than once (default False).
+    """
+    global _ACTIVE_PROJECT_DIR
+    if not file_path:
+        return "Error: 'file_path' is required."
+    if not target_content:
+        return "Error: 'target_content' cannot be empty."
+
+    target = (_ACTIVE_PROJECT_DIR / file_path).resolve()
+    if not str(target).startswith(str(_ACTIVE_PROJECT_DIR)):
+        return f"Error: Access denied. Cannot edit outside project directory: {file_path}"
+
+    if not target.exists():
+        return f"Error: File '{file_path}' does not exist."
+    if target.is_dir():
+        return f"Error: '{file_path}' is a directory, not a file."
+
+    try:
+        content = target.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading file '{file_path}': {e}"
+
+    occurrences = content.count(target_content)
+    if occurrences == 0:
+        return (
+            f"Error: target_content not found in '{file_path}'. "
+            f"Please verify exact indentation and line breaks, or inspect the file with read_project_file first."
+        )
+
+    if occurrences > 1 and not allow_multiple:
+        return (
+            f"Error: target_content matched {occurrences} times in '{file_path}'. "
+            f"To prevent unintended edits, provide more surrounding context lines to make the match unique, "
+            f"or set allow_multiple=True."
+        )
+
+    target_lines = target_content.splitlines()
+    repl_lines = replacement_content.splitlines()
+    console.print(f"\n  [bold yellow][Permission Request][/bold yellow] Agent requests permission to patch file: [cyan]{escape(file_path)}[/cyan] ({occurrences} match(es))")
+    console.print("  [red]--- Target Content ---[/red]")
+    for line in target_lines[:10]:
+        console.print(f"  [red]- {escape(line)}[/red]")
+    if len(target_lines) > 10:
+        console.print(f"  [dim red]  ... ({len(target_lines) - 10} more lines)[/dim red]")
+    console.print("  [green]+++ Replacement Content +++[/green]")
+    for line in repl_lines[:10]:
+        console.print(f"  [green]+ {escape(line)}[/green]")
+    if len(repl_lines) > 10:
+        console.print(f"  [dim green]  ... ({len(repl_lines) - 10} more lines)[/dim green]")
+
+    prompt_msg = f"Do you allow the agent to apply this patch to '{file_path}'?"
+    if not ask_user_permission(prompt_msg):
+        console.print(f"  [bold red][Permission Denied][/bold red] User rejected patch for '{escape(file_path)}'")
+        return f"Permission Denied: User did not grant permission to apply patch to '{file_path}'."
+
+    new_content = content.replace(target_content, replacement_content, -1 if allow_multiple else 1)
+    try:
+        target.write_text(new_content, encoding="utf-8")
+        console.print(f"  [bold green][OK][/bold green] Successfully patched '{escape(file_path)}'")
+        return f"Successfully applied patch to '{file_path}' ({occurrences} occurrence(s) replaced)."
+    except Exception as e:
+        return f"Error writing patched file '{file_path}': {e}"
+
+
+@tool
+def execute_shell_command(
+    command: str,
+    timeout: int = 60
+) -> str:
+    """Execute a shell command (such as cmake, make, ctest, clang-format, git status/diff)
+    inside the active project directory. Prompts the user for interactive permission before executing.
+
+    Args:
+        command: The shell command string to execute.
+        timeout: Maximum execution time in seconds (default 60).
+    """
+    global _ACTIVE_PROJECT_DIR
+    if not command or not command.strip():
+        return "Error: 'command' cannot be empty."
+
+    cmd_stripped = command.strip()
+    console.print(f"\n  [bold yellow][Permission Request][/bold yellow] Agent requests permission to execute command:")
+    console.print(f"    [bold cyan]{escape(cmd_stripped)}[/bold cyan] (cwd: {_ACTIVE_PROJECT_DIR.name})")
+
+    prompt_msg = f"Do you allow the agent to execute shell command: '{cmd_stripped}'?"
+    if not ask_user_permission(prompt_msg):
+        console.print(f"  [bold red][Permission Denied][/bold red] User rejected command: '{escape(cmd_stripped)}'")
+        return f"Permission Denied: User did not grant permission to execute command: '{cmd_stripped}'."
+
+    try:
+        console.print(f"  [dim]Running: {escape(cmd_stripped)}...[/dim]")
+        res = subprocess.run(
+            cmd_stripped,
+            shell=True,
+            cwd=str(_ACTIVE_PROJECT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        stdout = res.stdout.strip()
+        stderr = res.stderr.strip()
+        code = res.returncode
+
+        output_parts = [f"Exit code: {code}"]
+        if stdout:
+            lines = stdout.splitlines()
+            if len(lines) > 80:
+                stdout = "\n".join(lines[:80]) + f"\n... [Truncated {len(lines) - 80} lines]"
+            output_parts.append(f"STDOUT:\n{stdout}")
+        if stderr:
+            lines = stderr.splitlines()
+            if len(lines) > 80:
+                stderr = "\n".join(lines[:80]) + f"\n... [Truncated {len(lines) - 80} lines]"
+            output_parts.append(f"STDERR:\n{stderr}")
+        if not stdout and not stderr:
+            output_parts.append("(Command produced no output)")
+
+        status_tag = "[bold green][OK][/bold green]" if code == 0 else f"[bold red][Exit {code}][/bold red]"
+        console.print(f"  {status_tag} Command completed with exit code {code}")
+        return "\n\n".join(output_parts)
+    except subprocess.TimeoutExpired:
+        return f"Error: Command '{cmd_stripped}' timed out after {timeout} seconds."
+    except Exception as e:
+        return f"Error executing command '{cmd_stripped}': {e}"
+
+
+CODING_ASSISTANT_TOOLS = [
+    clangd_query,
+    ripgrep_search,
+    read_project_file,
+    list_project_structure,
+    write_project_file,
+    edit_project_file,
+    execute_shell_command
+]
+
 __all__ = [
     "clangd_query",
     "ripgrep_search",
     "read_project_file",
     "list_project_structure",
     "COMMON_CPP_TOOLS",
+    "write_project_file",
+    "edit_project_file",
+    "execute_shell_command",
+    "CODING_ASSISTANT_TOOLS",
     "set_active_project_dir",
     "get_active_project_dir",
     "ensure_compile_commands",
@@ -581,4 +873,11 @@ __all__ = [
     "parse_interface_methods",
     "discover_module_functions",
     "extract_touched_files",
+    "count_tokens",
+    "count_message_tokens",
+    "partition_messages_safely",
+    "set_require_permission",
+    "get_require_permission",
+    "set_permission_callback",
+    "ask_user_permission",
 ]
