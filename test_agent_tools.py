@@ -500,6 +500,52 @@ From src/order_repository.cpp:6:23 (definition)
         global _RECORDED_FINDINGS
         self.assertTrue(any("Buffer Overflow in SessionManager::create_session" in f["title"] for f in _RECORDED_FINDINGS))
 
+    def test_manage_context_with_summarization_includes_coverage_ledger(self):
+        from code_review_agent import manage_context_with_summarization
+        from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+
+        sys_msg = SystemMessage(content="You are a code auditor.")
+        human_msg = HumanMessage(content="Review module src.")
+        large_tool = ToolMessage(content="class SessionManager { ... }" + "A" * 15000, tool_call_id="call_1", name="clangd_query")
+        ai_msg = AIMessage(content="I inspected SessionManager.")
+        recent_tool = ToolMessage(content="void cleanup_all();", tool_call_id="call_2", name="clangd_query")
+
+        messages = [sys_msg, human_msg, large_tool, ai_msg, recent_tool]
+        audit_state = {
+            "module_name": "src",
+            "target_classes": ["SessionManager", "PaymentProcessor"],
+            "interfaced_classes": ["SessionManager"],
+            "discovered_functions": [
+                "SessionManager::create_session",
+                "SessionManager::cleanup_all",
+                "PaymentProcessor::process"
+            ],
+            "audited_functions": ["SessionManager::create_session"],
+            "target_files": ["src/session_manager.cpp", "src/payment_processor.cpp"],
+            "audited_files": ["src/session_manager.cpp"]
+        }
+
+        trimmed = manage_context_with_summarization(
+            messages,
+            max_tokens=4000,
+            reserve_tokens=500,
+            audit_state=audit_state
+        )
+
+        # The summary message is placed at index 2 (after sys_msg and human_msg)
+        summary_content = trimmed[2].content
+        self.assertIn("Audit Progress Ledger for Module 'src'", summary_content)
+        self.assertIn("ALREADY COVERED (DO NOT RE-AUDIT)", summary_content)
+        self.assertIn("SessionManager::create_session", summary_content)
+        self.assertIn("REMAINING TO BE AUDITED (PRIORITIZE)", summary_content)
+        self.assertIn("SessionManager::cleanup_all", summary_content)
+        self.assertIn("ALREADY INTERFACED (DO NOT RE-QUERY)", summary_content)
+        self.assertIn("SessionManager", summary_content)
+        self.assertIn("REMAINING CLASSES TO INTERFACE", summary_content)
+        self.assertIn("PaymentProcessor", summary_content)
+        self.assertIn("REMAINING UNINSPECTED FILES", summary_content)
+        self.assertIn("src/payment_processor.cpp", summary_content)
+
 
 if __name__ == "__main__":
     unittest.main()

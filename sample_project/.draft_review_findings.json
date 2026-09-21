@@ -5,7 +5,7 @@
     "details": "strcpy without bounds checking",
     "files_and_lines": "src/session_manager.cpp:18",
     "recommended_fix": "",
-    "timestamp": 1789733488.969038
+    "timestamp": 1789981786.2966459
   },
   {
     "category": "critical_flaw",
@@ -13,6 +13,6 @@
     "details": "strcpy without bounds check",
     "files_and_lines": "src/session_manager.cpp:18",
     "recommended_fix": "Use std::string or snprintf",
-    "timestamp": 1789733489.1073637
+    "timestamp": 1789981786.5060453
   }
 ]

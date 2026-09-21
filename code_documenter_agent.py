@@ -179,8 +179,17 @@ def manage_context_with_summarization(
             if text and len(text) > 30 and not is_substantive_documentation(text):
                 extracted_facts.append(f"• Exploration Note: {text[:250].replace(chr(10), ' ')}")
 
+    global _DOCUMENTED_SECTIONS
+    doc_lines = []
+    if _DOCUMENTED_SECTIONS:
+        doc_lines.append(f"**Codebase Documentation Progress ({len(_DOCUMENTED_SECTIONS)} sections already committed to disk - DO NOT DUPLICATE)**:")
+        for sec in _DOCUMENTED_SECTIONS[-5:]:
+            doc_lines.append(f"- Section `{sec['title']}`: {sec.get('summary', sec.get('preview', ''))[:140]}...")
+
     summary_text = (
-        "### Summary of Prior Codebase Exploration (Condensed to stay within strict context limit):\n"
+        "### Summary of Prior Codebase Exploration & Documentation Progress (Condensed to stay within strict context limit):\n\n"
+        + ("\n".join(doc_lines) + "\n\n" if doc_lines else "")
+        + "### Key Exploration Facts:\n"
         + ("\n".join(extracted_facts[:15]) if extracted_facts else "Explored files and symbols in current module.")
     )
 

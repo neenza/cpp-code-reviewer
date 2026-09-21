@@ -116,13 +116,16 @@ def manage_context_with_summarization(
     messages: List[BaseMessage],
     max_tokens: int = 32000,
     reserve_tokens: int = 2500,
-    summarize_threshold: Optional[int] = None
+    summarize_threshold: Optional[int] = None,
+    audit_state: Optional[Dict[str, Any]] = None
 ) -> List[BaseMessage]:
     """
     Enforce strict context size limit with proactive rolling summarization for the review agent.
     Never truncates active tool outputs to avoid information loss or code distortion.
     When cumulative conversation tokens exceed the threshold, safely summarizes completed older turns
     into a high-signal technical context summary while preserving recent active turns intact.
+    Injects the live audit progress ledger (content already covered vs. remaining to review)
+    directly into the condensed context to prevent repetitive tool queries and focus exploration.
     """
     if summarize_threshold is None:
         summarize_threshold = min(12000, int(max_tokens * 0.45))
@@ -158,9 +161,72 @@ def manage_context_with_summarization(
             if text and len(text) > 30:
                 extracted_facts.append(f"- Review Exploration Note: {text[:250].replace(chr(10), ' ')}")
 
+    progress_section = ""
+    if audit_state:
+        target_classes = audit_state.get("target_classes", [])
+        interfaced_classes = set(audit_state.get("interfaced_classes", []))
+        remaining_classes = [c for c in target_classes if c not in interfaced_classes]
+        covered_classes = [c for c in target_classes if c in interfaced_classes]
+
+        audited_funcs = set(audit_state.get("audited_functions", []))
+        discovered_funcs = audit_state.get("discovered_functions", [])
+        covered_funcs = [
+            f for f in discovered_funcs
+            if f in audited_funcs or f.split("::")[-1] in audited_funcs
+        ]
+        remaining_funcs = [
+            f for f in discovered_funcs
+            if f not in audited_funcs and f.split("::")[-1] not in audited_funcs
+        ]
+
+        target_files = audit_state.get("target_files", [])
+        audited_files = set(audit_state.get("audited_files", []))
+        covered_files = [f for f in target_files if f in audited_files]
+        remaining_files = [f for f in target_files if f not in audited_files]
+
+        module_name = audit_state.get("module_name", "")
+        global _RECORDED_FINDINGS
+        findings_count = len(_RECORDED_FINDINGS)
+
+        p_lines = [
+            f"**Audit Progress Ledger for Module '{module_name}' (Live Coverage Status)**:",
+            f"- **Functions Audited**: {len(covered_funcs)} / {len(discovered_funcs)} covered",
+        ]
+        if covered_funcs:
+            sample_cov = covered_funcs[:8]
+            cov_str = ", ".join(f"`{f}`" for f in sample_cov)
+            if len(covered_funcs) > 8:
+                cov_str += f" (+{len(covered_funcs) - 8} more already reviewed)"
+            p_lines.append(f"  * ALREADY COVERED (DO NOT RE-AUDIT): {cov_str}")
+        if remaining_funcs:
+            sample_rem = remaining_funcs[:12]
+            rem_str = ", ".join(f"`{f}`" for f in sample_rem)
+            if len(remaining_funcs) > 12:
+                rem_str += f" (+{len(remaining_funcs) - 12} more remaining)"
+            p_lines.append(f"  * REMAINING TO BE AUDITED (PRIORITIZE): {rem_str}")
+        elif discovered_funcs:
+            p_lines.append("  * REMAINING TO BE AUDITED: None (all discovered functions audited)")
+
+        p_lines.append(f"- **Classes Interfaced**: {len(covered_classes)} / {len(target_classes)} covered")
+        if covered_classes:
+            p_lines.append(f"  * ALREADY INTERFACED (DO NOT RE-QUERY): {', '.join(f'`{c}`' for c in covered_classes)}")
+        if remaining_classes:
+            p_lines.append(f"  * REMAINING CLASSES TO INTERFACE: {', '.join(f'`{c}`' for c in remaining_classes)}")
+
+        p_lines.append(f"- **Files Inspected**: {len(covered_files)} / {len(target_files)} covered")
+        if covered_files:
+            p_lines.append(f"  * ALREADY TOUCHED: {', '.join(f'`{f}`' for f in covered_files[:8])}")
+        if remaining_files:
+            p_lines.append(f"  * REMAINING UNINSPECTED FILES: {', '.join(f'`{f}`' for f in remaining_files[:8])}")
+
+        p_lines.append(f"- **Review Findings Recorded So Far**: {findings_count} findings")
+        progress_section = "\n".join(p_lines) + "\n\n"
+
     summary_text = (
-        "### Prior Code Review Steps Summary (Condensed to stay within strict context limit):\n"
-        + ("\n".join(extracted_facts[:15]) if extracted_facts else "Audited earlier classes and functions in current module.")
+        "### Prior Code Review Steps & Progress Summary (Condensed to stay within strict context limit):\n\n"
+        + progress_section
+        + "### Key Technical Facts & Observations from Prior Steps:\n"
+        + ("\n".join(extracted_facts[:15]) if extracted_facts else "- Audited earlier classes and functions in current module.")
     )
 
     summary_message = SystemMessage(content=summary_text)
@@ -654,7 +720,8 @@ def build_module_reviewer(
         trimmed_messages = manage_context_with_summarization(
             state["messages"],
             max_tokens=max_context_tokens,
-            summarize_threshold=summarize_threshold
+            summarize_threshold=summarize_threshold,
+            audit_state=state
         )
         print_context_banner(trimmed_messages, max_tokens=max_context_tokens, stage="Agent LLM Invocation")
 
