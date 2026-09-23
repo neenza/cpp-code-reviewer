@@ -1573,7 +1573,8 @@ def run_codebase_documenter(
     summarize_threshold: int = 12000,
     module_max_steps: int = 50,
     target_dirs: Optional[List[str]] = None,
-    ignore_dirs: Optional[List[str]] = None
+    ignore_dirs: Optional[List[str]] = None,
+    user_prompt: str = ""
 ) -> Path:
     """
     Execute the autonomous codebase documentation agent loop.
