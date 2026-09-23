@@ -126,7 +126,22 @@ def manage_context_with_summarization(
         f"(exceeding threshold {effective_limit:,}). Active Rolling Summarization initiated...[/bold yellow]"
     )
 
-    older, recent = partition_messages_safely(messages, target_recent_count=4)
+    # Preserve initial system prompt and root user instruction
+    preserved_header = []
+    if messages and isinstance(messages[0], SystemMessage):
+        preserved_header.append(messages[0])
+        tail_start = 1
+    else:
+        preserved_header.append(SystemMessage(content=CODING_ASSISTANT_SYSTEM_PROMPT))
+        tail_start = 0
+
+    if len(messages) > tail_start and isinstance(messages[tail_start], HumanMessage):
+        preserved_header.append(messages[tail_start])
+        conversation_tail = list(messages[tail_start + 1:])
+    else:
+        conversation_tail = list(messages[tail_start:])
+
+    older, recent = partition_messages_safely(conversation_tail, target_recent_count=4)
     if not older:
         return messages
 
@@ -180,10 +195,7 @@ def manage_context_with_summarization(
         )
     )
 
-    # Preserve initial system prompt if present
-    base_sys = messages[0] if messages and isinstance(messages[0], SystemMessage) else SystemMessage(content=CODING_ASSISTANT_SYSTEM_PROMPT)
-
-    condensed_messages = [base_sys, summary_msg] + recent
+    condensed_messages = preserved_header + [summary_msg] + recent
     new_tokens = sum(count_message_tokens(m) for m in condensed_messages)
     saved_tokens = cur_tokens - new_tokens
     pct_saved = (saved_tokens / max(1, cur_tokens)) * 100

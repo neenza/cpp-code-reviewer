@@ -962,6 +962,8 @@ From src/order_repository.cpp:6:23 (definition)
         sys_msg = SystemMessage(content="System coding prompt")
         user_msg = HumanMessage(content="Please refactor session storage")
         older_turn_0 = AIMessage(content="I will check repository structure.")
+        older_turn_a = AIMessage(content="Found 12 classes across repository.")
+        older_turn_b = AIMessage(content="Beginning inspection of session management classes.")
         older_turn_1 = AIMessage(
             content="",
             tool_calls=[{"name": "clangd_query", "args": {"command": "show", "symbol_or_query": "SessionManager"}, "id": "call_1"}]
@@ -974,7 +976,10 @@ From src/order_repository.cpp:6:23 (definition)
         )
         recent_tool = ToolMessage(content="Successfully applied patch", tool_call_id="call_2", name="edit_project_file")
 
-        messages = [sys_msg, user_msg, older_turn_0, older_turn_1, older_tool_1, older_turn_2, recent_ai, recent_tool]
+        messages = [
+            sys_msg, user_msg, older_turn_0, older_turn_a, older_turn_b,
+            older_turn_1, older_tool_1, older_turn_2, recent_ai, recent_tool
+        ]
 
         # Trigger summarization with low threshold
         summarized = manage_context_with_summarization(
@@ -986,9 +991,13 @@ From src/order_repository.cpp:6:23 (definition)
         )
 
         self.assertLess(len(summarized), len(messages))
-        summary_content = summarized[1].content
+        summary_messages = [m for m in summarized if "ACTIVE ROLLING CONTEXT SUMMARY" in str(getattr(m, "content", ""))]
+        self.assertEqual(len(summary_messages), 1)
+        summary_content = summary_messages[0].content
         self.assertIn("ACTIVE ROLLING CONTEXT SUMMARY", summary_content)
         self.assertIn("Refactored database logic", summary_content)
+        # Root user instruction preserved intact
+        self.assertIn(user_msg, summarized)
         # Recent active turns preserved intact
         self.assertIn(recent_ai, summarized)
         self.assertIn(recent_tool, summarized)
