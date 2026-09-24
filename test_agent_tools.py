@@ -1043,6 +1043,69 @@ From src/order_repository.cpp:6:23 (definition)
 
             set_permission_callback(None)
 
+    def test_permission_rejection_reason_feedback(self):
+        from cpp_agent_tools import (
+            _parse_permission_input,
+            PermissionResult,
+            edit_project_file,
+            write_project_file,
+            execute_shell_command,
+            set_active_project_dir,
+            set_require_permission,
+            set_permission_callback
+        )
+        import tempfile
+
+        # 1. Unit test parser
+        self.assertEqual(_parse_permission_input("y"), (True, ""))
+        self.assertEqual(_parse_permission_input("YES"), (True, ""))
+        self.assertEqual(_parse_permission_input("n"), (False, ""))
+        self.assertEqual(_parse_permission_input(""), (False, ""))
+        self.assertEqual(_parse_permission_input("no, use std::unique_ptr"), (False, "use std::unique_ptr"))
+        self.assertEqual(_parse_permission_input("n: keep comments"), (False, "keep comments"))
+        self.assertEqual(_parse_permission_input("reject: breaks ABI"), (False, "breaks ABI"))
+        self.assertEqual(_parse_permission_input("prefer using std::string_view"), (False, "prefer using std::string_view"))
+
+        # 2. Test edit_project_file with rejection feedback string
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+            set_require_permission(True)
+
+            cpp_file = tmp_path / "main.cpp"
+            cpp_file.write_text("int foo() { return 1; }\n", encoding="utf-8")
+
+            set_permission_callback(lambda prompt: "no, change the return type to double")
+            res_edit = edit_project_file.invoke({
+                "file_path": "main.cpp",
+                "target_content": "int foo() { return 1; }",
+                "replacement_content": "int foo() { return 2; }"
+            })
+            self.assertIn("Permission Denied", res_edit)
+            self.assertIn("User Rejection Reason / Feedback: change the return type to double", res_edit)
+            self.assertIn("adjust your patch", res_edit)
+            self.assertEqual(cpp_file.read_text(encoding="utf-8"), "int foo() { return 1; }\n")
+
+            # 3. Test write_project_file with rejection feedback tuple
+            set_permission_callback(lambda prompt: (False, "File path should be in src/ directory"))
+            res_write = write_project_file.invoke({
+                "file_path": "foo.cpp",
+                "content": "int bar;"
+            })
+            self.assertIn("Permission Denied", res_write)
+            self.assertIn("User Rejection Reason / Feedback: File path should be in src/ directory", res_write)
+            self.assertFalse((tmp_path / "foo.cpp").exists())
+
+            # 4. Test execute_shell_command with rejection feedback
+            set_permission_callback(lambda prompt: "do not run destructive commands")
+            res_shell = execute_shell_command.invoke({
+                "command": "rm -rf build"
+            })
+            self.assertIn("Permission Denied", res_shell)
+            self.assertIn("User Rejection Reason / Feedback: do not run destructive commands", res_shell)
+
+            set_permission_callback(None)
+
 
 if __name__ == "__main__":
     unittest.main()

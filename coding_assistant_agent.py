@@ -77,11 +77,11 @@ CORE ENGINEERING PRINCIPLES:
    - When appropriate, verify that modified code builds or tests pass using 'execute_shell_command'.
    - If a build fails or tests produce errors, inspect the error messages and iteratively fix the code.
 
-4. USER PERMISSION PROTOCOL:
+4. USER PERMISSION & FEEDBACK PROTOCOL:
    - All file modifications ('write_project_file', 'edit_project_file') and shell executions ('execute_shell_command')
      automatically require user confirmation before execution.
-   - If the user denies permission for an action, respect their decision, understand the constraint, and either
-     propose an alternative approach or ask clarifying questions.
+   - If the user denies permission or provides an explicit rejection reason/feedback, treat their feedback as a hard constraint.
+     Immediately adjust your approach, patch, or command to address their feedback and proceed towards the user's objective.
 
 5. CONTEXT PRESERVATION:
    - Do NOT read large files (>80 lines) completely; use targeted line ranges or AST tools.
@@ -285,7 +285,9 @@ def build_coding_assistant_graph(
             return "tools"
         return END
 
-    tool_node = ToolNode(active_tools)
+    # Enforce sequential execution (max_concurrency=1) so multiple interactive file edits
+    # execute one after another without console interleaving or file-overwrite race conditions.
+    tool_node = ToolNode(active_tools).with_config(max_concurrency=1)
 
     wf = StateGraph(MessagesState)
     wf.add_node("agent", agent_step)
@@ -382,7 +384,7 @@ def run_interactive_assistant(
         try:
             result = app.invoke(
                 {"messages": conversation_messages},
-                {"recursion_limit": max_steps}
+                {"recursion_limit": max_steps, "max_concurrency": 1}
             )
             conversation_messages = result.get("messages", conversation_messages)
             last_msg = conversation_messages[-1]
@@ -448,7 +450,7 @@ def run_oneshot_assistant(
 
     result = app.invoke(
         {"messages": initial_messages},
-        {"recursion_limit": max_steps}
+        {"recursion_limit": max_steps, "max_concurrency": 1}
     )
 
     last_msg = result.get("messages", [])[-1]

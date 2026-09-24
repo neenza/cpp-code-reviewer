@@ -16,6 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.markup import escape
+from rich.panel import Panel
 
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, ToolMessage, BaseMessage
@@ -102,22 +103,90 @@ def set_permission_callback(cb: Optional[Any]) -> None:
     _PERMISSION_CALLBACK = cb
 
 
-def ask_user_permission(prompt_text: str) -> bool:
-    """Prompt the user for permission to execute a file modification or shell execution."""
+class PermissionResult:
+    """Result of an interactive permission query, containing approval status and optional rejection reason."""
+    def __init__(self, allowed: bool, reason: str = ""):
+        self.allowed = bool(allowed)
+        self.reason = str(reason).strip() if reason else ""
+
+    def __bool__(self) -> bool:
+        return self.allowed
+
+    def __iter__(self):
+        return iter((self.allowed, self.reason))
+
+    def __getitem__(self, index: int):
+        return (self.allowed, self.reason)[index]
+
+    def __len__(self) -> int:
+        return 2
+
+    def __repr__(self) -> str:
+        return f"PermissionResult(allowed={self.allowed}, reason={self.reason!r})"
+
+
+def _parse_permission_input(raw: str) -> tuple[bool, str]:
+    """Parse user terminal response into (allowed: bool, reason: str)."""
+    ans = raw.strip()
+    if ans.lower() in ("y", "yes", "allow", "approve"):
+        return True, ""
+    if ans.lower() in ("n", "no", "deny", "reject", ""):
+        return False, ""
+
+    # Strip common leading denial prefixes if present
+    reason = ans
+    for pfx in ("no, ", "no: ", "no - ", "n, ", "n: ", "n - ", "reject: ", "reject, ", "deny: ", "deny - "):
+        if reason.lower().startswith(pfx):
+            reason = reason[len(pfx):].strip()
+            break
+    return False, reason
+
+
+def ask_user_permission(prompt_text: str) -> PermissionResult:
+    """Prompt the user for permission to execute a file modification or shell execution.
+    
+    Accepts:
+      - 'y' / 'yes' to approve.
+      - 'n' / 'no' or Enter to reject without feedback.
+      - Any other text as an explicit rejection reason/feedback passed back to the model.
+    """
     global _REQUIRE_PERMISSION, _PERMISSION_CALLBACK
     if not _REQUIRE_PERMISSION:
-        return True
+        return PermissionResult(True, "")
+
     if _PERMISSION_CALLBACK is not None:
-        return bool(_PERMISSION_CALLBACK(prompt_text))
+        try:
+            res = _PERMISSION_CALLBACK(prompt_text)
+            if isinstance(res, PermissionResult):
+                return res
+            if isinstance(res, tuple) and len(res) == 2:
+                return PermissionResult(bool(res[0]), str(res[1]))
+            if isinstance(res, bool):
+                return PermissionResult(res, "")
+            if isinstance(res, str):
+                allowed, reason = _parse_permission_input(res)
+                return PermissionResult(allowed, reason)
+            return PermissionResult(bool(res), "")
+        except Exception:
+            return PermissionResult(False, "")
+
     try:
-        from rich.prompt import Confirm
-        return Confirm.ask(prompt_text, default=False)
+        from rich.prompt import Prompt
+        prompt_formatted = (
+            f"[bold cyan]{prompt_text}[/bold cyan] "
+            f"[dim][[bold green]y[/bold green] to allow, [bold red]n[/bold red] or [yellow]<reason>[/yellow] to reject][/dim]"
+        )
+        raw_ans = Prompt.ask(prompt_formatted, default="n")
+    except (KeyboardInterrupt, EOFError):
+        return PermissionResult(False, "")
     except Exception:
         try:
-            ans = input(f"{prompt_text} [y/N]: ").strip().lower()
-            return ans in ("y", "yes")
-        except EOFError:
-            return False
+            raw_ans = input(f"{prompt_text} [y to allow, n or <reason> to reject]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return PermissionResult(False, "")
+
+    allowed, reason = _parse_permission_input(raw_ans)
+    return PermissionResult(allowed, reason)
 
 
 def set_active_project_dir(project_dir: Path) -> None:
@@ -689,7 +758,15 @@ def write_project_file(
 
     console.print(f"\n  [bold yellow][Permission Request][/bold yellow] Agent requests permission to {action_str} file: [cyan]{escape(file_path)}[/cyan] ({lines} lines, {len(content):,} chars)")
     prompt_msg = f"Do you allow the agent to {action_str} '{file_path}'?"
-    if not ask_user_permission(prompt_msg):
+    perm = ask_user_permission(prompt_msg)
+    if not perm.allowed:
+        if perm.reason:
+            console.print(f"  [bold red][Permission Denied][/bold red] User rejected {action_str} for '{escape(file_path)}' with reason: [yellow]{escape(perm.reason)}[/yellow]")
+            return (
+                f"Permission Denied: User rejected request to {action_str} file '{file_path}'.\n"
+                f"User Rejection Reason / Feedback: {perm.reason}\n"
+                f"Please carefully inspect the feedback above and adjust your implementation accordingly."
+            )
         console.print(f"  [bold red][Permission Denied][/bold red] User rejected {action_str} for '{escape(file_path)}'")
         return f"Permission Denied: User did not grant permission to {action_str} '{file_path}'."
 
@@ -767,7 +844,15 @@ def edit_project_file(
         console.print(f"  [dim green]  ... ({len(repl_lines) - 10} more lines)[/dim green]")
 
     prompt_msg = f"Do you allow the agent to apply this patch to '{file_path}'?"
-    if not ask_user_permission(prompt_msg):
+    perm = ask_user_permission(prompt_msg)
+    if not perm.allowed:
+        if perm.reason:
+            console.print(f"  [bold red][Permission Denied][/bold red] User rejected patch for '{escape(file_path)}' with reason: [yellow]{escape(perm.reason)}[/yellow]")
+            return (
+                f"Permission Denied: User rejected the proposed patch for '{file_path}'.\n"
+                f"User Rejection Reason / Feedback: {perm.reason}\n"
+                f"Please carefully inspect the feedback above and adjust your patch or approach accordingly."
+            )
         console.print(f"  [bold red][Permission Denied][/bold red] User rejected patch for '{escape(file_path)}'")
         return f"Permission Denied: User did not grant permission to apply patch to '{file_path}'."
 
@@ -801,7 +886,15 @@ def execute_shell_command(
     console.print(f"    [bold cyan]{escape(cmd_stripped)}[/bold cyan] (cwd: {_ACTIVE_PROJECT_DIR.name})")
 
     prompt_msg = f"Do you allow the agent to execute shell command: '{cmd_stripped}'?"
-    if not ask_user_permission(prompt_msg):
+    perm = ask_user_permission(prompt_msg)
+    if not perm.allowed:
+        if perm.reason:
+            console.print(f"  [bold red][Permission Denied][/bold red] User rejected command: '{escape(cmd_stripped)}' with reason: [yellow]{escape(perm.reason)}[/yellow]")
+            return (
+                f"Permission Denied: User rejected the execution of shell command '{cmd_stripped}'.\n"
+                f"User Rejection Reason / Feedback: {perm.reason}\n"
+                f"Please carefully inspect the feedback above and adjust or cancel your command accordingly."
+            )
         console.print(f"  [bold red][Permission Denied][/bold red] User rejected command: '{escape(cmd_stripped)}'")
         return f"Permission Denied: User did not grant permission to execute command: '{cmd_stripped}'."
 
@@ -819,26 +912,60 @@ def execute_shell_command(
         stderr = res.stderr.strip()
         code = res.returncode
 
+        status_tag = "[bold green][OK][/bold green]" if code == 0 else f"[bold red][Exit {code}][/bold red]"
+        console.print(f"  {status_tag} Command completed with exit code {code}")
+
+        if stdout:
+            lines = stdout.splitlines()
+            if len(lines) > 80:
+                display_stdout = "\n".join(lines[:40]) + f"\n\n[dim]... [Truncated {len(lines) - 80} lines in terminal preview] ...[/dim]\n\n" + "\n".join(lines[-40:])
+            else:
+                display_stdout = stdout
+            console.print(Panel(
+                escape(display_stdout),
+                title=f"STDOUT: [bold cyan]{escape(cmd_stripped)}[/bold cyan]",
+                border_style="dim green" if code == 0 else "yellow"
+            ))
+
+        if stderr:
+            lines = stderr.splitlines()
+            if len(lines) > 80:
+                display_stderr = "\n".join(lines[:40]) + f"\n\n[dim]... [Truncated {len(lines) - 80} lines in terminal preview] ...[/dim]\n\n" + "\n".join(lines[-40:])
+            else:
+                display_stderr = stderr
+            console.print(Panel(
+                escape(display_stderr),
+                title=f"STDERR: [bold red]{escape(cmd_stripped)}[/bold red]",
+                border_style="bold red"
+            ))
+
+        if not stdout and not stderr:
+            console.print("  [dim](Command produced no output)[/dim]")
+
         output_parts = [f"Exit code: {code}"]
         if stdout:
             lines = stdout.splitlines()
             if len(lines) > 80:
-                stdout = "\n".join(lines[:80]) + f"\n... [Truncated {len(lines) - 80} lines]"
-            output_parts.append(f"STDOUT:\n{stdout}")
+                stdout_for_llm = "\n".join(lines[:80]) + f"\n... [Truncated {len(lines) - 80} lines]"
+            else:
+                stdout_for_llm = stdout
+            output_parts.append(f"STDOUT:\n{stdout_for_llm}")
         if stderr:
             lines = stderr.splitlines()
             if len(lines) > 80:
-                stderr = "\n".join(lines[:80]) + f"\n... [Truncated {len(lines) - 80} lines]"
-            output_parts.append(f"STDERR:\n{stderr}")
+                stderr_for_llm = "\n".join(lines[:80]) + f"\n... [Truncated {len(lines) - 80} lines]"
+            else:
+                stderr_for_llm = stderr
+            output_parts.append(f"STDERR:\n{stderr_for_llm}")
         if not stdout and not stderr:
             output_parts.append("(Command produced no output)")
 
-        status_tag = "[bold green][OK][/bold green]" if code == 0 else f"[bold red][Exit {code}][/bold red]"
-        console.print(f"  {status_tag} Command completed with exit code {code}")
         return "\n\n".join(output_parts)
     except subprocess.TimeoutExpired:
+        console.print(f"  [bold red][Timeout][/bold red] Command '{escape(cmd_stripped)}' timed out after {timeout}s")
         return f"Error: Command '{cmd_stripped}' timed out after {timeout} seconds."
     except Exception as e:
+        console.print(f"  [bold red][Error][/bold red] Error executing command '{escape(cmd_stripped)}': {e}")
         return f"Error executing command '{cmd_stripped}': {e}"
 
 
@@ -880,4 +1007,5 @@ __all__ = [
     "get_require_permission",
     "set_permission_callback",
     "ask_user_permission",
+    "PermissionResult",
 ]
