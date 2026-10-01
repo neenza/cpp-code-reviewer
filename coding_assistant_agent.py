@@ -12,7 +12,7 @@ import sys
 import json
 import time
 import argparse
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, TypedDict, Annotated
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,7 +23,7 @@ from rich.prompt import Prompt
 from rich.markup import escape
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, BaseMessage
-from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
 from cpp_agent_tools import (
@@ -113,9 +113,10 @@ def manage_context_with_summarization(
     Proactively compresses conversation history when total tokens reach summarize_threshold.
     Preserves recent active turns and in-flight tool messages without truncation.
     """
+    effective_reserve = min(reserve_tokens, int(max_tokens * 0.15))
     if summarize_threshold is None:
         summarize_threshold = min(12000, int(max_tokens * 0.45))
-    effective_limit = min(summarize_threshold, max_tokens - reserve_tokens)
+    effective_limit = min(summarize_threshold, max(1, max_tokens - effective_reserve))
 
     cur_tokens = sum(count_message_tokens(m) for m in messages)
     if cur_tokens < effective_limit:
@@ -209,8 +210,23 @@ def manage_context_with_summarization(
 
 
 # ============================================================================
-# Graph Builder
+# State & Graph Builder
 # ============================================================================
+
+def message_reducer(existing: List[BaseMessage], update: Any) -> List[BaseMessage]:
+    """Custom reducer supporting list concatenation and explicit context override upon summarization."""
+    if isinstance(update, tuple) and len(update) == 2 and update[0] == "override":
+        return list(update[1])
+    if isinstance(update, list):
+        return list(existing) + list(update)
+    if isinstance(update, BaseMessage):
+        return list(existing) + [update]
+    return list(existing)
+
+
+class CodingAssistantState(TypedDict):
+    messages: Annotated[List[BaseMessage], message_reducer]
+
 
 def build_coding_assistant_graph(
     llm,
@@ -224,7 +240,7 @@ def build_coding_assistant_graph(
     active_tools = tools if tools is not None else CODING_ASSISTANT_TOOLS
     llm_with_tools = llm.bind_tools(active_tools)
 
-    def agent_step(state: MessagesState) -> Dict[str, Any]:
+    def agent_step(state: CodingAssistantState) -> Dict[str, Any]:
         raw_messages = state["messages"]
 
         # 1. Manage context limits with proactive rolling summarization
@@ -271,12 +287,12 @@ def build_coding_assistant_graph(
                     preview += "..."
                 console.print(f"  [dim]Assistant Response: {escape(preview)}[/dim]")
 
-        # If context was summarized, replace messages; otherwise append response
+        # If context was summarized, override state messages; otherwise append response
         if len(compact_messages) != len(raw_messages):
-            return {"messages": compact_messages + [response]}
+            return {"messages": ("override", compact_messages + [response])}
         return {"messages": [response]}
 
-    def route_assistant_step(state: MessagesState) -> str:
+    def route_assistant_step(state: CodingAssistantState) -> str:
         messages = state.get("messages", [])
         if not messages:
             return END
@@ -289,7 +305,7 @@ def build_coding_assistant_graph(
     # execute one after another without console interleaving or file-overwrite race conditions.
     tool_node = ToolNode(active_tools).with_config(max_concurrency=1)
 
-    wf = StateGraph(MessagesState)
+    wf = StateGraph(CodingAssistantState)
     wf.add_node("agent", agent_step)
     wf.add_node("tools", tool_node)
 

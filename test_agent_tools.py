@@ -1043,6 +1043,72 @@ From src/order_repository.cpp:6:23 (definition)
 
             set_permission_callback(None)
 
+    def test_coding_assistant_graph_summarization_no_ballooning(self):
+        from coding_assistant_agent import build_coding_assistant_graph, CodingAssistantState
+        from cpp_agent_tools import set_permission_callback, set_require_permission, set_active_project_dir, count_message_tokens
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+            set_require_permission(False)
+
+            sample = tmp_path / "hello.txt"
+            sample.write_text("Hello World\n", encoding="utf-8")
+
+            class ScriptedLLMWithSummarizer:
+                def __init__(self):
+                    self.step = 0
+                def bind_tools(self, tools):
+                    return self
+                def invoke(self, messages):
+                    # Check if this is a summarizer invoke or graph step
+                    if any("condensing conversation" in str(m.content).lower() for m in messages):
+                        return AIMessage(content="Summarized past turns: Inspected project files.")
+                    self.step += 1
+                    if self.step == 1:
+                        return AIMessage(
+                            content="",
+                            tool_calls=[{
+                                "name": "read_project_file",
+                                "args": {"file_path": "hello.txt"},
+                                "id": "tc_read"
+                            }]
+                        )
+                    return AIMessage(content="Done reading hello.txt.")
+
+            app = build_coding_assistant_graph(
+                llm=ScriptedLLMWithSummarizer(),
+                max_context_tokens=10000,
+                summarize_threshold=500
+            )
+
+            # Build an initial history with >500 tokens across multiple older turns
+            initial_history = [
+                SystemMessage(content="You are a helpful coding assistant."),
+                HumanMessage(content="Please investigate repository " + "word "*100),
+                AIMessage(content="Turn 1 note: " + "detail "*100),
+                HumanMessage(content="Turn 2 question: " + "query "*100),
+                AIMessage(content="Turn 2 note: " + "answer "*100),
+                HumanMessage(content="Turn 3 question: " + "query "*100),
+            ]
+            init_tokens = sum(count_message_tokens(m) for m in initial_history)
+            self.assertGreater(init_tokens, 500)
+
+            res = app.invoke({"messages": initial_history}, {"recursion_limit": 10})
+            final_messages = res["messages"]
+
+            # Verify context was condensed and did NOT balloon by appending
+            final_tokens = sum(count_message_tokens(m) for m in final_messages)
+            self.assertLess(final_tokens, init_tokens)
+
+            # Exactly one rolling summary message should exist
+            summary_msgs = [m for m in final_messages if "ACTIVE ROLLING CONTEXT SUMMARY" in str(getattr(m, "content", ""))]
+            self.assertEqual(len(summary_msgs), 1)
+
+            # State message count must be smaller than initial + turns (no duplicates)
+            self.assertLess(len(final_messages), len(initial_history) + 4)
+
     def test_permission_rejection_reason_feedback(self):
         from cpp_agent_tools import (
             _parse_permission_input,
