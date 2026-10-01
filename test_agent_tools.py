@@ -1172,6 +1172,88 @@ From src/order_repository.cpp:6:23 (definition)
 
             set_permission_callback(None)
 
+    def test_custom_system_prompt_file_preserved_without_summarization(self):
+        from coding_assistant_agent import (
+            load_system_prompt,
+            build_coding_assistant_graph,
+            CODING_ASSISTANT_SYSTEM_PROMPT
+        )
+        from cpp_agent_tools import count_message_tokens, set_active_project_dir, set_require_permission
+        import tempfile
+
+        # 1. Default system prompt when None is passed
+        self.assertEqual(load_system_prompt(None), CODING_ASSISTANT_SYSTEM_PROMPT)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+            set_require_permission(False)
+
+            # Create custom system prompt file
+            prompt_file = tmp_path / "custom_instructions.md"
+            prompt_content = (
+                "# Repository Engineering Rules\n"
+                "1. Always prefer std::string_view for read-only string parameters.\n"
+                "2. Never use raw pointers; use std::unique_ptr or std::shared_ptr.\n"
+                "3. Enforce strict const-correctness everywhere."
+            )
+            prompt_file.write_text(prompt_content, encoding="utf-8")
+
+            # 2. Verify load_system_prompt embeds custom file rules
+            loaded_prompt = load_system_prompt(str(prompt_file))
+            self.assertIn("CUSTOM SYSTEM INSTRUCTIONS & CONSTRAINTS", loaded_prompt)
+            self.assertIn("std::string_view", loaded_prompt)
+            self.assertIn("CORE ENGINEERING PRINCIPLES", loaded_prompt)
+
+            # 3. Test graph execution with rolling summarization to ensure system prompt is never reduced
+            class MockLLM:
+                def __init__(self):
+                    self.step = 0
+                def bind_tools(self, tools):
+                    return self
+                def invoke(self, messages):
+                    if any("condensing conversation" in str(m.content).lower() for m in messages):
+                        return AIMessage(content="Summarized past turns: Addressed memory guidelines.")
+                    self.step += 1
+                    return AIMessage(content="Verified all guidelines.")
+
+            app = build_coding_assistant_graph(
+                llm=MockLLM(),
+                max_context_tokens=10000,
+                summarize_threshold=400,
+                system_prompt=loaded_prompt
+            )
+
+            # Initial history with custom prompt at index 0 exceeding threshold with older and recent turns
+            initial_history = [
+                SystemMessage(content=loaded_prompt),
+                HumanMessage(content="User task: " + "investigate "*80),
+                AIMessage(content="Turn 1 note: " + "detail "*80),
+                HumanMessage(content="Turn 2 question: " + "query "*80),
+                AIMessage(content="Turn 2 note: " + "answer "*80),
+                HumanMessage(content="Turn 3 question: " + "query "*80),
+                AIMessage(content="Turn 3 note: " + "investigate "*80),
+                HumanMessage(content="Turn 4 question: " + "followup "*80),
+                AIMessage(content="Turn 4 note: " + "resolution "*80),
+                HumanMessage(content="Turn 5 question: " + "next step "*80),
+            ]
+            init_tokens = sum(count_message_tokens(m) for m in initial_history)
+            self.assertGreater(init_tokens, 400)
+
+            res = app.invoke({"messages": initial_history}, {"recursion_limit": 10})
+            final_messages = res["messages"]
+
+            # First message MUST be the exact unreduced SystemMessage containing the custom prompt
+            root_system_msg = final_messages[0]
+            self.assertIsInstance(root_system_msg, SystemMessage)
+            self.assertEqual(root_system_msg.content, loaded_prompt)
+            self.assertIn("std::string_view", root_system_msg.content)
+            self.assertIn("strict const-correctness", root_system_msg.content)
+
+            # Exactly one rolling summary message should exist in addition to the preserved root system message
+            summary_msgs = [m for m in final_messages if "ACTIVE ROLLING CONTEXT SUMMARY" in str(getattr(m, "content", ""))]
+            self.assertEqual(len(summary_msgs), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

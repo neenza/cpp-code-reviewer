@@ -89,6 +89,46 @@ CORE ENGINEERING PRINCIPLES:
 ════════════════════════════════════════════════════════════════════════════════
 """
 
+
+def load_system_prompt(system_prompt_file: Optional[str] = None) -> str:
+    """Load system prompt from file if provided, combining base engineering guidelines with custom instructions."""
+    if not system_prompt_file:
+        return CODING_ASSISTANT_SYSTEM_PROMPT
+
+    path = Path(system_prompt_file).resolve()
+    if not path.exists():
+        console.print(f"[bold red]Error: System prompt file '{system_prompt_file}' does not exist.[/bold red]")
+        sys.exit(1)
+    if path.is_dir():
+        console.print(f"[bold red]Error: System prompt path '{system_prompt_file}' is a directory, not a file.[/bold red]")
+        sys.exit(1)
+
+    try:
+        custom_content = path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        console.print(f"[bold red]Error reading system prompt file '{system_prompt_file}': {e}[/bold red]")
+        sys.exit(1)
+
+    if not custom_content:
+        console.print(f"[yellow]Warning: System prompt file '{system_prompt_file}' is empty. Using default system prompt.[/yellow]")
+        return CODING_ASSISTANT_SYSTEM_PROMPT
+
+    # If the custom prompt already contains full assistant persona/principles, use it directly;
+    # otherwise append to base tool principles to ensure tool-calling competency is preserved.
+    if "CORE ENGINEERING PRINCIPLES" in custom_content or "clangd_query" in custom_content:
+        return custom_content
+
+    return (
+        f"{CODING_ASSISTANT_SYSTEM_PROMPT}\n"
+        f"════════════════════════════════════════════════════════════════════════════════\n"
+        f"CUSTOM SYSTEM INSTRUCTIONS & CONSTRAINTS (Loaded from {path.name}):\n"
+        f"The following user instructions are authoritative, must be strictly followed across all turns,\n"
+        f"and override any conflicting default behaviors:\n\n"
+        f"{custom_content}\n"
+        f"════════════════════════════════════════════════════════════════════════════════\n"
+    )
+
+
 # ============================================================================
 # Context Management with Rolling Summarization
 # ============================================================================
@@ -107,11 +147,13 @@ def manage_context_with_summarization(
     llm,
     max_tokens: int = 32000,
     reserve_tokens: int = 3000,
-    summarize_threshold: Optional[int] = None
+    summarize_threshold: Optional[int] = None,
+    default_system_prompt: Optional[str] = None
 ) -> List[BaseMessage]:
     """
     Proactively compresses conversation history when total tokens reach summarize_threshold.
     Preserves recent active turns and in-flight tool messages without truncation.
+    Permanently preserves the root system prompt (including custom instructions files) intact.
     """
     effective_reserve = min(reserve_tokens, int(max_tokens * 0.15))
     if summarize_threshold is None:
@@ -133,7 +175,8 @@ def manage_context_with_summarization(
         preserved_header.append(messages[0])
         tail_start = 1
     else:
-        preserved_header.append(SystemMessage(content=CODING_ASSISTANT_SYSTEM_PROMPT))
+        fallback_prompt = default_system_prompt or CODING_ASSISTANT_SYSTEM_PROMPT
+        preserved_header.append(SystemMessage(content=fallback_prompt))
         tail_start = 0
 
     if len(messages) > tail_start and isinstance(messages[tail_start], HumanMessage):
@@ -232,7 +275,8 @@ def build_coding_assistant_graph(
     llm,
     tools: Optional[List[Any]] = None,
     max_context_tokens: int = 32000,
-    summarize_threshold: Optional[int] = None
+    summarize_threshold: Optional[int] = None,
+    system_prompt: Optional[str] = None
 ):
     """
     Build the interactive and one-shot LangGraph coding assistant workflow.
@@ -248,7 +292,8 @@ def build_coding_assistant_graph(
             raw_messages,
             llm=llm,
             max_tokens=max_context_tokens,
-            summarize_threshold=summarize_threshold
+            summarize_threshold=summarize_threshold,
+            default_system_prompt=system_prompt
         )
 
         # 2. Display context usage banner
@@ -331,7 +376,8 @@ def run_interactive_assistant(
     max_context_tokens: int = 32000,
     summarize_threshold: int = 12000,
     max_steps: int = 60,
-    auto_approve: bool = False
+    auto_approve: bool = False,
+    system_prompt_file: Optional[str] = None
 ) -> None:
     """Start an interactive coding assistant REPL session."""
     proj_path = Path(project_dir).resolve()
@@ -343,14 +389,19 @@ def run_interactive_assistant(
     ensure_compile_commands(proj_path)
     set_require_permission(not auto_approve)
 
+    system_prompt = load_system_prompt(system_prompt_file)
+
     if not model_name:
         model_name = "llama3.1:8b" if provider.lower() == "ollama" else "gemini-2.5-flash"
+
+    prompt_source = f"File: {Path(system_prompt_file).name}" if system_prompt_file else "Default Engineering Principles"
 
     console.print(Panel(
         f"[bold cyan]C++ General Coding Assistant[/bold cyan]\n"
         f"Project Path    : [yellow]{proj_path}[/yellow]\n"
         f"Provider        : [green]{provider}[/green]\n"
         f"Model           : [green]{model_name}[/green]\n"
+        f"System Prompt   : [green]{prompt_source}[/green]\n"
         f"Context Limit   : [magenta]{max_context_tokens:,} tokens[/magenta]\n"
         f"Summarize Limit : [magenta]{summarize_threshold:,} tokens[/magenta]\n"
         f"Permissions     : [yellow]{'Interactive Prompts' if not auto_approve else 'Auto-Approved (--yes)'}[/yellow]\n"
@@ -370,11 +421,12 @@ def run_interactive_assistant(
     app = build_coding_assistant_graph(
         llm=llm,
         max_context_tokens=max_context_tokens,
-        summarize_threshold=summarize_threshold
+        summarize_threshold=summarize_threshold,
+        system_prompt=system_prompt
     )
 
     conversation_messages: List[BaseMessage] = [
-        SystemMessage(content=CODING_ASSISTANT_SYSTEM_PROMPT)
+        SystemMessage(content=system_prompt)
     ]
 
     while True:
@@ -391,7 +443,7 @@ def run_interactive_assistant(
             console.print("[green]Goodbye![/green]")
             break
         if user_input.lower() == "clear":
-            conversation_messages = [SystemMessage(content=CODING_ASSISTANT_SYSTEM_PROMPT)]
+            conversation_messages = [SystemMessage(content=system_prompt)]
             console.print("[dim]Conversation history cleared.[/dim]")
             continue
 
@@ -420,7 +472,8 @@ def run_oneshot_assistant(
     max_context_tokens: int = 32000,
     summarize_threshold: int = 12000,
     max_steps: int = 60,
-    auto_approve: bool = False
+    auto_approve: bool = False,
+    system_prompt_file: Optional[str] = None
 ) -> str:
     """Execute a single-shot goal or instruction autonomously."""
     proj_path = Path(project_dir).resolve()
@@ -432,8 +485,12 @@ def run_oneshot_assistant(
     ensure_compile_commands(proj_path)
     set_require_permission(not auto_approve)
 
+    system_prompt = load_system_prompt(system_prompt_file)
+
     if not model_name:
         model_name = "llama3.1:8b" if provider.lower() == "ollama" else "gemini-2.5-flash"
+
+    prompt_source = f"File: {Path(system_prompt_file).name}" if system_prompt_file else "Default Engineering Principles"
 
     console.print(Panel(
         f"[bold cyan]C++ General Coding Assistant (Autonomous Task)[/bold cyan]\n"
@@ -441,6 +498,7 @@ def run_oneshot_assistant(
         f"Directive       : [white]{prompt}[/white]\n"
         f"Provider        : [green]{provider}[/green]\n"
         f"Model           : [green]{model_name}[/green]\n"
+        f"System Prompt   : [green]{prompt_source}[/green]\n"
         f"Permissions     : [yellow]{'Interactive Prompts' if not auto_approve else 'Auto-Approved (--yes)'}[/yellow]",
         title="Task Execution",
         border_style="cyan"
@@ -456,11 +514,12 @@ def run_oneshot_assistant(
     app = build_coding_assistant_graph(
         llm=llm,
         max_context_tokens=max_context_tokens,
-        summarize_threshold=summarize_threshold
+        summarize_threshold=summarize_threshold,
+        system_prompt=system_prompt
     )
 
     initial_messages: List[BaseMessage] = [
-        SystemMessage(content=CODING_ASSISTANT_SYSTEM_PROMPT),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=prompt)
     ]
 
@@ -496,6 +555,13 @@ def parse_args():
         type=str,
         default="",
         help="One-shot prompt / task directive. If omitted, starts interactive REPL."
+    )
+    parser.add_argument(
+        "--system-prompt-file",
+        "-spf",
+        type=str,
+        default=None,
+        help="Path to a custom system prompt / instructions file. Preserved permanently and never summarized."
     )
     parser.add_argument(
         "--provider",
@@ -556,7 +622,8 @@ if __name__ == "__main__":
             max_context_tokens=args.max_context_tokens,
             summarize_threshold=args.context_summarize_threshold,
             max_steps=args.max_steps,
-            auto_approve=args.auto_approve
+            auto_approve=args.auto_approve,
+            system_prompt_file=args.system_prompt_file
         )
     else:
         run_interactive_assistant(
@@ -567,5 +634,6 @@ if __name__ == "__main__":
             max_context_tokens=args.max_context_tokens,
             summarize_threshold=args.context_summarize_threshold,
             max_steps=args.max_steps,
-            auto_approve=args.auto_approve
+            auto_approve=args.auto_approve,
+            system_prompt_file=args.system_prompt_file
         )
