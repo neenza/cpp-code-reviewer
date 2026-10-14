@@ -39,6 +39,8 @@ from cpp_agent_tools import (
     get_active_project_dir,
     ensure_compile_commands,
     get_llm,
+    invoke_llm_with_retries,
+    set_current_context_stats,
     extract_text,
     extract_message_text,
     discover_project_classes,
@@ -117,6 +119,7 @@ def partition_messages_safely(
 def print_context_banner(messages: List[BaseMessage], max_tokens: int, stage: str = "Step") -> int:
     """Print current context size, percentage, and stage banner."""
     total_tokens = sum(count_message_tokens(m) for m in messages)
+    set_current_context_stats(total_tokens, max_tokens)
     pct = (total_tokens / max(1, max_tokens)) * 100
     color = "green" if pct < 40 else ("yellow" if pct < 75 else "bold red")
     console.print(f"  [{color}][Context: {total_tokens:,} / {max_tokens:,} tokens ({pct:.1f}%)] | {stage}[/{color}]")
@@ -766,23 +769,13 @@ def build_module_reviewer(
         )
         print_context_banner(trimmed_messages, max_tokens=max_context_tokens, stage="Agent LLM Invocation")
 
-        max_retries = 5
-        base_delay = 6
-        response = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = llm_with_tools.invoke(trimmed_messages)
-                break
-            except Exception as e:
-                err_msg = str(e)
-                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
-                    import re
-                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
-                    wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
-                    console.print(f"[yellow]Rate limit reached (429). Waiting {wait_time:.1f}s (attempt {attempt}/{max_retries})...[/yellow]")
-                    time.sleep(wait_time)
-                else:
-                    raise e
+        # Invoke LLM with rate limit & tool-syntax recovery retries
+        response = invoke_llm_with_retries(
+            llm=llm_with_tools,
+            messages=trimmed_messages,
+            max_retries=5,
+            stage_name="Code Reviewer Step"
+        )
 
         # Calculate exact context size including the model's generated response
         total_tokens = sum(count_message_tokens(m) for m in trimmed_messages) + count_message_tokens(response)
@@ -886,9 +879,9 @@ def review_module_node_factory(
             f"1. AVOID FULL-FILE READS: NEVER use 'read_project_file' on large files (> 80 lines). Full file reads cause context bloat! "
             f"Only use 'read_project_file' for small files (< 80 lines) or build configs (CMakeLists.txt).\n"
             f"2. SEMANTIC CLASS INSPECTION: For each class/struct in this module:\n"
-            f"   - Run 'clangd_query' with command='interface' and symbol_or_query='<ClassName>' to inspect its layout, member variables, and method signatures.\n"
-            f"   - For every non-trivial method discovered in the interface, run 'clangd_query' with command='show' and symbol_or_query='<ClassName::MethodName>' to inspect its implementation code.\n"
-            f"3. FUNCTION AUDIT: For all standalone functions, inspect their source code with 'clangd_query(command=\"show\", symbol_or_query=\"<FunctionName>\")'.\n"
+            f"   - Run 'clangd_query' with command='interface' and symbol_or_query='ClassName' to inspect its layout, member variables, and method signatures.\n"
+            f"   - For every non-trivial method discovered in the interface, run 'clangd_query' with command='show' and symbol_or_query='ClassName::MethodName' to inspect its implementation code.\n"
+            f"3. FUNCTION AUDIT: For all standalone functions, inspect their source code with 'clangd_query(command=\"show\", symbol_or_query=\"FunctionName\")'.\n"
             f"   Ensure ALL symbols, classes, and member functions in this module are read and reviewed at least once!\n"
             f"4. USAGES & REFERENCES: Run 'clangd_query' with command='usages' to check where key classes and functions are called, verifying ownership and call-site safety.\n"
             f"5. MEMORY & CONCURRENCY CHECKS: Run 'ripgrep_search' with path_filter='{current_module}' to check for:\n"

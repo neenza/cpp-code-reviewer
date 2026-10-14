@@ -46,11 +46,15 @@ class TestCodeReviewExplainerAndDocumenterTools(unittest.TestCase):
         set_active_project_dir(self.sample_dir)
         set_permission_callback(None)
         set_require_permission(False)
+        from cpp_agent_tools import clear_pending_full_reads
+        clear_pending_full_reads()
 
     def tearDown(self):
         set_active_project_dir(self.sample_dir)
         set_permission_callback(None)
         set_require_permission(False)
+        from cpp_agent_tools import clear_pending_full_reads
+        clear_pending_full_reads()
 
     def test_read_cmakelists(self):
         content = read_project_file.invoke({"file_path": "CMakeLists.txt"})
@@ -1253,6 +1257,151 @@ From src/order_repository.cpp:6:23 (definition)
             # Exactly one rolling summary message should exist in addition to the preserved root system message
             summary_msgs = [m for m in final_messages if "ACTIVE ROLLING CONTEXT SUMMARY" in str(getattr(m, "content", ""))]
             self.assertEqual(len(summary_msgs), 1)
+
+    def test_invoke_llm_with_retries_recovers_from_xml_syntax_error(self):
+        from cpp_agent_tools import invoke_llm_with_retries
+        from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+        received_calls = []
+
+        class MockGlitchyLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                received_calls.append(messages)
+                if self.calls == 1:
+                    # Emulate exact Ollama XML syntax failure encountered by user
+                    raise Exception(
+                        "Execution error: XML syntax error on line 10: element <parameter> closed by </function> (status code: -1)"
+                    )
+                return AIMessage(content="Tool call executed successfully with clean syntax.")
+
+        llm = MockGlitchyLLM()
+        input_msgs = [HumanMessage(content="Please edit the file")]
+
+        response = invoke_llm_with_retries(llm, input_msgs, max_retries=3, base_delay=0.01)
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(response.content, "Tool call executed successfully with clean syntax.")
+
+        # Verify that attempt 2 was passed the corrective recovery system hint
+        second_call_msgs = received_calls[1]
+        self.assertGreater(len(second_call_msgs), len(input_msgs))
+        hint_msg = second_call_msgs[-1]
+        self.assertIsInstance(hint_msg, SystemMessage)
+        self.assertIn("TOOL CALL SYNTAX RECOVERY", hint_msg.content)
+        self.assertIn("element <parameter> closed by </function>", hint_msg.content)
+
+    def test_invoke_llm_with_retries_raises_after_max_retries_on_xml_syntax_error(self):
+        from cpp_agent_tools import invoke_llm_with_retries
+        from langchain_core.messages import HumanMessage
+
+        class MockAlwaysGlitchyLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                raise Exception("Execution error: XML syntax error on line 7: element <parameter> closed by </function> (status code: -1)")
+
+        llm = MockAlwaysGlitchyLLM()
+        input_msgs = [HumanMessage(content="Please edit file")]
+
+        with self.assertRaises(RuntimeError) as ctx:
+            invoke_llm_with_retries(llm, input_msgs, max_retries=2, base_delay=0.01)
+
+        self.assertEqual(llm.calls, 2)
+        self.assertIn("XML syntax error persisted after 2 attempts", str(ctx.exception))
+
+    def test_read_project_file_range_up_to_1000_lines(self):
+        from cpp_agent_tools import read_project_file, set_active_project_dir
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+
+            # Create a 600-line python file
+            py_file = tmp_path / "service.py"
+            py_file.write_text("\n".join(f"line_{i} = {i}" for i in range(1, 601)), encoding="utf-8")
+
+            # Request lines 1 to 500 (500 lines) -> should NOT be capped
+            res = read_project_file.invoke({"file_path": "service.py", "start_line": 1, "end_line": 500})
+            self.assertIn("Lines 1-500 of 600", res)
+            self.assertNotIn("Range capped", res)
+            self.assertIn("line_1 = 1", res)
+            self.assertIn("line_500 = 500", res)
+            self.assertNotIn("line_501", res)
+
+    def test_read_project_file_caps_over_1000_lines_and_recommends_appropriately(self):
+        from cpp_agent_tools import read_project_file, set_active_project_dir
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+
+            # 1. Non-C++ file (Python) with 1500 lines
+            py_file = tmp_path / "heavy.py"
+            py_file.write_text("\n".join(f"def func_{i}(): pass" for i in range(1, 1501)), encoding="utf-8")
+
+            res_py = read_project_file.invoke({"file_path": "heavy.py", "start_line": 1, "end_line": 1400})
+            self.assertIn("Lines 1-1000 of 1500", res_py)
+            self.assertIn("Range capped at 1,000 lines", res_py)
+            self.assertIn("ripgrep_search", res_py)
+            self.assertNotIn("clangd_query", res_py)
+
+            # 2. C++ file with 1500 lines
+            cpp_file = tmp_path / "heavy.cpp"
+            cpp_file.write_text("\n".join(f"void func_{i}() {{}}" for i in range(1, 1501)), encoding="utf-8")
+
+            res_cpp = read_project_file.invoke({"file_path": "heavy.cpp", "start_line": 1, "end_line": 1400})
+            self.assertIn("Lines 1-1000 of 1500", res_cpp)
+            self.assertIn("Range capped at 1,000 lines", res_cpp)
+            self.assertIn("clangd_query", res_cpp)
+
+    def test_read_project_file_large_file_confirmation_nudge_and_re_request(self):
+        from cpp_agent_tools import (
+            read_project_file,
+            set_active_project_dir,
+            set_current_context_stats,
+            clear_pending_full_reads
+        )
+        import tempfile
+
+        clear_pending_full_reads()
+        set_current_context_stats(current_tokens=4500, max_tokens=32000)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            set_active_project_dir(tmp_path)
+
+            # Create a 300-line file (> 120 lines threshold)
+            large_py = tmp_path / "dataset_loader.py"
+            large_py.write_text("\n".join(f"# Line {i}: data processing step" for i in range(1, 301)), encoding="utf-8")
+
+            # 1. First unconstrained read request triggers large file confirmation nudge
+            first_res = read_project_file.invoke({"file_path": "dataset_loader.py"})
+            self.assertIn("Large File Read Notice - Confirmation Required", first_res)
+            self.assertIn("300 lines", first_res)
+            self.assertIn("Estimated Token Consumption", first_res)
+            self.assertIn("4,500 / 32,000 tokens (14.1%)", first_res)
+            self.assertIn("call 'read_project_file' on 'dataset_loader.py' again", first_res)
+            self.assertIn("ripgrep_search", first_res)
+            self.assertNotIn("clangd_query", first_res)
+
+            # 2. Second request on the same file confirms and delivers full content
+            second_res = read_project_file.invoke({"file_path": "dataset_loader.py"})
+            self.assertIn("Lines 1-300 of 300", second_res)
+            self.assertIn("Line 1: data processing step", second_res)
+            self.assertIn("Line 300: data processing step", second_res)
+
+            # 3. Reading with confirm_full_read=True bypasses the nudge on first try
+            clear_pending_full_reads()
+            direct_res = read_project_file.invoke({"file_path": "dataset_loader.py", "confirm_full_read": True})
+            self.assertIn("Lines 1-300 of 300", direct_res)
+            self.assertNotIn("Large File Read Notice", direct_res)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,8 @@ from cpp_agent_tools import (
     get_active_project_dir,
     ensure_compile_commands,
     get_llm,
+    invoke_llm_with_retries,
+    set_current_context_stats,
     extract_text,
     discover_project_classes,
     group_classes_by_module,
@@ -120,6 +122,7 @@ def partition_messages_safely(
 def print_context_banner(messages: List[BaseMessage], max_tokens: int, stage: str = "Step") -> int:
     """Print current context size, percentage, and stage banner."""
     total_tokens = sum(count_message_tokens(m) for m in messages)
+    set_current_context_stats(total_tokens, max_tokens)
     pct = (total_tokens / max(1, max_tokens)) * 100
     color = "green" if pct < 40 else ("yellow" if pct < 75 else "bold red")
     console.print(f"  [{color}][Context: {total_tokens:,} / {max_tokens:,} tokens ({pct:.1f}%)] | {stage}[/{color}]")
@@ -566,9 +569,9 @@ CORE INSTRUCTIONS & STANDARDS:
 3. SEMANTIC CODE INSPECTION OVER FULL-FILE READS:
    - AVOID FULL-FILE READS: NEVER use 'read_project_file' on large files (> 80 lines). Full file reads trigger severe context bloat and rate limits!
      Full-file reading is strictly restricted to small files (< 80 lines) or build configs (CMakeLists.txt).
-   - Use 'clangd_query' with command='interface' and symbol_or_query='<ClassName>' to inspect class declarations, public interfaces, and member variables.
-   - Use 'clangd_query' with command='show' and symbol_or_query='<ClassName::MethodName>' to inspect method bodies, inner logic, and step-by-step algorithms.
-   - Use 'clangd_query' with command='usages' to inspect callers, references, and data-flow across the codebase.
+   - Use 'clangd_query' with command='interface' and symbol_or_query='ClassName' to inspect class declarations, public interfaces, and member variables.
+   - Use 'clangd_query' with command='show' and symbol_or_query='ClassName::MethodName' to inspect method bodies, inner logic, and step-by-step algorithms.
+   - Use 'clangd_query' with command='usages' and symbol_or_query='SymbolName' to inspect callers, references, and data-flow across the codebase.
    - Use 'ripgrep_search' with pattern='class ' or 'struct ' to discover all classes and structs in the codebase.
    - You MUST ensure all symbols, classes, and key functions in the assigned module are read and documented at least once!
    - Use 'ripgrep_search' to verify concurrency primitives ('mutex', 'shared_mutex', 'atomic') and resource ownership (smart pointers, RAII).
@@ -857,23 +860,13 @@ def build_module_documenter_runner(
         )
         print_context_banner(trimmed_messages, max_tokens=max_context_tokens, stage="Agent LLM Invocation")
 
-        max_retries = 5
-        base_delay = 6
-        response = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = llm_with_tools.invoke(trimmed_messages)
-                break
-            except Exception as e:
-                err_msg = str(e)
-                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
-                    import re
-                    match = re.search(r"retry in (\d+(?:\d+)?)s", err_msg, re.IGNORECASE)
-                    wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
-                    console.print(f"[yellow]Rate limit (429). Waiting {wait_time:.1f}s (attempt {attempt}/{max_retries})...[/yellow]")
-                    time.sleep(wait_time)
-                else:
-                    raise e
+        # Invoke LLM with rate limit & tool-syntax recovery retries
+        response = invoke_llm_with_retries(
+            llm=llm_with_tools,
+            messages=trimmed_messages,
+            max_retries=5,
+            stage_name="Documenter Step"
+        )
 
         # Calculate exact context size including the model's generated response
         total_tokens = sum(count_message_tokens(m) for m in trimmed_messages) + count_message_tokens(response)
@@ -1374,12 +1367,12 @@ def document_module_node_factory(
             f"1. AVOID FULL-FILE READS: NEVER use 'read_project_file' on large files (> 80 lines). Full file reads trigger severe context bloat! "
             f"Full-file reading is strictly restricted to small files (< 80 lines) or build configs (CMakeLists.txt).\n"
             f"2. SEMANTIC CLASS INSPECTION:\n"
-            f"   - For each class/struct in this module ({classes_str}), call 'clangd_query(command=\"interface\", symbol_or_query=\"<ClassName>\")' "
+            f"   - For each class/struct in this module ({classes_str}), call 'clangd_query(command=\"interface\", symbol_or_query=\"ClassName\")' "
             f"to inspect public interfaces, member variables, and methods.\n"
-            f"   - For member function bodies, algorithms, and inner logic, call 'clangd_query(command=\"show\", symbol_or_query=\"<ClassName::MethodName>\")'.\n"
-            f"   - For cross-file dependencies and callers, call 'clangd_query(command=\"usages\", symbol_or_query=\"<SymbolName>\")'.\n"
+            f"   - For member function bodies, algorithms, and inner logic, call 'clangd_query(command=\"show\", symbol_or_query=\"ClassName::MethodName\")'.\n"
+            f"   - For cross-file dependencies and callers, call 'clangd_query(command=\"usages\", symbol_or_query=\"SymbolName\")'.\n"
             f"3. FUNCTION AUDIT & ENSURE ALL SYMBOLS INSPECTED:\n"
-            f"   - For standalone functions, inspect with 'clangd_query(command=\"show\", symbol_or_query=\"<FunctionName>\")'.\n"
+            f"   - For standalone functions, inspect with 'clangd_query(command=\"show\", symbol_or_query=\"FunctionName\")'.\n"
             f"   - Ensure ALL symbols, classes, and member functions in this module are read and documented at least once!\n"
             f"   - Use 'ripgrep_search' with pattern='class ' or 'struct ' to discover any additional unmapped types.\n"
             f"4. INCREMENTAL DOCUMENTATION PROTOCOL:\n"

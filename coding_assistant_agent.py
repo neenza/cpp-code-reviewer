@@ -39,6 +39,8 @@ from cpp_agent_tools import (
     get_active_project_dir,
     ensure_compile_commands,
     get_llm,
+    invoke_llm_with_retries,
+    set_current_context_stats,
     extract_text,
     extract_message_text,
     count_tokens,
@@ -62,10 +64,10 @@ Your mission is to help the user investigate, design, implement, modify, debug, 
 CORE ENGINEERING PRINCIPLES:
 1. INVESTIGATE BEFORE MODIFYING:
    - Always inspect relevant code before proposing or making changes.
-   - Use 'clangd_query(command="interface", symbol_or_query="<ClassName>")' to inspect class declarations.
-   - Use 'clangd_query(command="show", symbol_or_query="<ClassName::MethodName>")' to inspect method implementations.
-   - Use 'clangd_query(command="usages", symbol_or_query="<SymbolName>")' to inspect callers and dependencies.
-   - Use 'ripgrep_search' to locate keywords, configs, macros, or error strings across files.
+   - For C/C++ files: use 'clangd_query(command="interface", symbol_or_query="ClassName")' to inspect class declarations,
+     'clangd_query(command="show", symbol_or_query="ClassName::MethodName")' for method implementations,
+     and 'clangd_query(command="usages", symbol_or_query="SymbolName")' for callers and dependencies.
+   - For Python or non-C++ files: use 'ripgrep_search' to locate function/class definitions, variables, or error strings with line numbers first.
    - Never guess function signatures, member variable names, or include paths.
 
 2. SURGICAL & MINIMAL FILE EDITS:
@@ -84,8 +86,14 @@ CORE ENGINEERING PRINCIPLES:
      Immediately adjust your approach, patch, or command to address their feedback and proceed towards the user's objective.
 
 5. CONTEXT PRESERVATION:
-   - Do NOT read large files (>80 lines) completely; use targeted line ranges or AST tools.
+   - When reading files with 'read_project_file', specify targeted line ranges (up to 1,000 lines) or AST/search tools.
+   - Full file reads are supported; for large files (>120 lines), the tool prompts with token estimates on first request.
    - When explaining your changes, cite exact file paths and line numbers.
+
+6. TOOL CALLING SYNTAX & PROTOCOL:
+   - Ensure all tool call arguments are well-formed strings.
+   - When calling tools that use XML formatting (such as local Ollama models), strictly ensure every opened '<parameter>' tag is closed with its matching '</parameter>' tag before closing '</function>'.
+   - Avoid raw, unescaped markup tags or unmatched angle brackets inside parameter arguments that could disrupt XML parsing.
 ════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -136,6 +144,7 @@ def load_system_prompt(system_prompt_file: Optional[str] = None) -> str:
 def print_context_banner(messages: List[BaseMessage], max_tokens: int, stage: str = "Assistant Step") -> int:
     """Display current context token usage and utilization percentage."""
     total_tokens = sum(count_message_tokens(m) for m in messages)
+    set_current_context_stats(total_tokens, max_tokens)
     pct = (total_tokens / max(1, max_tokens)) * 100
     color = "green" if pct < 45 else ("yellow" if pct < 75 else "bold red")
     console.print(f"  [{color}][Context: {total_tokens:,} / {max_tokens:,} tokens ({pct:.1f}%)] | {stage}[/{color}]")
@@ -299,23 +308,13 @@ def build_coding_assistant_graph(
         # 2. Display context usage banner
         print_context_banner(compact_messages, max_tokens=max_context_tokens, stage="Agent Step")
 
-        # 3. Invoke LLM with rate limit retries
-        max_retries = 5
-        base_delay = 6
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = llm_with_tools.invoke(compact_messages)
-                break
-            except Exception as e:
-                err_msg = str(e)
-                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
-                    import re
-                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
-                    wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
-                    console.print(f"[yellow]Rate limit reached (429). Waiting {wait_time:.1f}s (attempt {attempt}/{max_retries})...[/yellow]")
-                    time.sleep(wait_time)
-                else:
-                    raise e
+        # 3. Invoke LLM with rate limit & tool-syntax recovery retries
+        response = invoke_llm_with_retries(
+            llm=llm_with_tools,
+            messages=compact_messages,
+            max_retries=5,
+            stage_name="Coding Assistant Step"
+        )
 
         # Print tool calls if present
         if getattr(response, "tool_calls", None):

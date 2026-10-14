@@ -19,7 +19,7 @@ from rich.markup import escape
 from rich.panel import Panel
 
 from langchain_core.tools import tool
-from langchain_core.messages import AIMessage, ToolMessage, BaseMessage
+from langchain_core.messages import AIMessage, ToolMessage, BaseMessage, SystemMessage
 
 load_dotenv()
 console = Console()
@@ -83,6 +83,30 @@ def partition_messages_safely(
 _ACTIVE_PROJECT_DIR: Path = Path.cwd()
 _REQUIRE_PERMISSION: bool = True
 _PERMISSION_CALLBACK: Optional[Any] = None
+
+_CURRENT_CONTEXT_TOKENS: int = 0
+_MAX_CONTEXT_TOKENS: int = 32000
+_PENDING_FULL_READ_CONFIRMATIONS: set = set()
+BIG_FILE_LINE_THRESHOLD: int = 120
+
+
+def set_current_context_stats(current_tokens: int, max_tokens: int = 32000) -> None:
+    """Store active conversation context tokens and max limit for tool diagnostics."""
+    global _CURRENT_CONTEXT_TOKENS, _MAX_CONTEXT_TOKENS
+    _CURRENT_CONTEXT_TOKENS = current_tokens
+    _MAX_CONTEXT_TOKENS = max_tokens
+
+
+def get_current_context_stats() -> tuple:
+    """Retrieve active context tokens and max limit."""
+    global _CURRENT_CONTEXT_TOKENS, _MAX_CONTEXT_TOKENS
+    return _CURRENT_CONTEXT_TOKENS, _MAX_CONTEXT_TOKENS
+
+
+def clear_pending_full_reads() -> None:
+    """Clear all pending full file read confirmations."""
+    global _PENDING_FULL_READ_CONFIRMATIONS
+    _PENDING_FULL_READ_CONFIRMATIONS.clear()
 
 
 def set_require_permission(val: bool) -> None:
@@ -174,14 +198,14 @@ def ask_user_permission(prompt_text: str) -> PermissionResult:
         from rich.prompt import Prompt
         prompt_formatted = (
             f"[bold cyan]{prompt_text}[/bold cyan] "
-            f"[dim][[bold green]y[/bold green] to allow, [bold red]n[/bold red] or [yellow]<reason>[/yellow] to reject][/dim]"
+            f"[dim][[bold green]y[/bold green] to allow, [bold red]n[/bold red] or [yellow]reason[/yellow] to reject][/dim]"
         )
         raw_ans = Prompt.ask(prompt_formatted, default="n")
     except (KeyboardInterrupt, EOFError):
         return PermissionResult(False, "")
     except Exception:
         try:
-            raw_ans = input(f"{prompt_text} [y to allow, n or <reason> to reject]: ").strip()
+            raw_ans = input(f"{prompt_text} [y to allow, n or reason to reject]: ").strip()
         except (KeyboardInterrupt, EOFError):
             return PermissionResult(False, "")
 
@@ -375,22 +399,25 @@ def read_project_file(
     filepath: Optional[str] = None,
     start_line: Optional[int] = None,
     end_line: Optional[int] = None,
+    confirm_full_read: bool = False,
     **kwargs: Any
 ) -> str:
-    """Read contents of a file in the project (such as CMakeLists.txt, small configs, or targeted line ranges).
-    NOTE: NEVER read entire large files (> 80 lines) directly. Instead, use 'clangd_query' with:
-      - command='interface', symbol_or_query='<ClassName>' to inspect class layouts and public APIs.
-      - command='show', symbol_or_query='<ClassName::MethodName>' to inspect method definitions.
-      - command='usages', symbol_or_query='<SymbolName>' to inspect references across the project.
-      - Or provide 'start_line' and 'end_line' to read specific focused ranges (up to 80 lines).
-    Full file reads without line limits are strictly permitted only for small files (< 80 lines) or config files.
+    """Read contents of a file in the project (up to 1,000 lines per range request, or full file reads with confirmation on large files).
+
+    - For C/C++ files (.c, .cpp, .h, etc.): prioritize using 'clangd_query' (command='interface', 'show', 'usages')
+      to inspect class structures and method implementations semantically without reading raw files.
+    - For non-C++ files (.py, .sh, .cmake, configs, etc.): use 'ripgrep_search' to locate definitions
+      or specify targeted ranges using 'start_line' and 'end_line' (up to 1,000 lines).
+    - Full file reads are permitted for all files; for large files (> 120 lines), the tool prompts with token
+      cost and current context stats on the first request; repeating the request confirms and delivers the content.
 
     Args:
-      file_path: Relative path to the file to inspect (e.g. 'src/engine/worker.cpp'). Also accepts 'path' or 'filename'.
+      file_path: Relative path to the file to inspect (e.g. 'src/engine/worker.cpp' or 'scripts/run.py').
       start_line: Optional starting line number (1-indexed).
       end_line: Optional ending line number (1-indexed).
+      confirm_full_read: Set to True to bypass the large-file confirmation prompt when reading an entire large file.
     """
-    global _ACTIVE_PROJECT_DIR
+    global _ACTIVE_PROJECT_DIR, _PENDING_FULL_READ_CONFIRMATIONS
 
     resolved = file_path or path or filename or filepath or kwargs.get("file") or kwargs.get("file_name") or ""
     if not resolved:
@@ -410,20 +437,65 @@ def read_project_file(
             lines = f.readlines()
 
         total_lines = len(lines)
-        is_config = target.name.lower() in ["cmakelists.txt", "conanfile.txt", "vcpkg.json"] or target.name.endswith(".json")
+        CPP_EXTENSIONS = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx", ".tpp", ".ipp"}
+        is_cpp_file = target.suffix.lower() in CPP_EXTENSIONS
+        resolved_key = str(target)
 
-        # Prohibit reading full large files (> 80 lines)
-        if start_line is None and end_line is None and total_lines > 80 and not is_config:
-            selected = lines[:60]
-            formatted = "".join(f"{i:4d} | {line}" for i, line in enumerate(selected, start=1))
-            return (
-                f"File: {resolved} (Showing lines 1-60 of {total_lines} total lines)\n\n{formatted}\n\n"
-                f"[Notice: File '{resolved}' has {total_lines} lines. Reading large files entirely is prohibited to prevent context bloat. "
-                f"Showing first 60 lines. Please prioritize using 'clangd_query(command='interface', symbol_or_query='<ClassName>')' "
-                f"to inspect class structure, 'clangd_query(command='show', symbol_or_query='<MethodName>')' to inspect method implementations, "
-                f"'clangd_query(command='usages', symbol_or_query='<SymbolName>')' for cross-file references, "
-                f"or specify 'start_line' and 'end_line' (max 80 lines) for a targeted range.]"
+        # Check if caller is requesting the full file without bounds
+        is_requesting_full_file = (
+            start_line is None and end_line is None
+        ) or (
+            start_line == 1 and end_line is not None and end_line >= total_lines
+        )
+
+        # When reading a really big file (> 120 lines) in full, nudge for confirmation first
+        if is_requesting_full_file and total_lines > BIG_FILE_LINE_THRESHOLD:
+            has_confirmed = (
+                confirm_full_read
+                or kwargs.get("confirm", False)
+                or (resolved_key in _PENDING_FULL_READ_CONFIRMATIONS)
             )
+            if not has_confirmed:
+                _PENDING_FULL_READ_CONFIRMATIONS.add(resolved_key)
+                raw_text = "".join(lines)
+                est_tokens = count_tokens(raw_text)
+                file_bytes = len(raw_text.encode("utf-8", errors="replace"))
+                cur_tokens, max_tokens = get_current_context_stats()
+                cur_pct = (cur_tokens / max(1, max_tokens)) * 100 if cur_tokens > 0 else 0.0
+                impact_pct = (est_tokens / max(1, max_tokens)) * 100
+
+                if is_cpp_file:
+                    alt_advice = (
+                        "Recommended C/C++ Alternatives:\n"
+                        "  - 'clangd_query(command=\"interface\", symbol_or_query=\"ClassName\")' to inspect class structures.\n"
+                        "  - 'clangd_query(command=\"show\", symbol_or_query=\"ClassName::MethodName\")' to inspect method implementations.\n"
+                        "  - 'clangd_query(command=\"usages\", symbol_or_query=\"SymbolName\")' for references across the codebase.\n"
+                        "  - Or specify focused line ranges using 'start_line' and 'end_line' (up to 1,000 lines)."
+                    )
+                else:
+                    alt_advice = (
+                        f"Recommended Alternatives for {target.suffix or 'non-C++'} files:\n"
+                        "  - Use 'ripgrep_search' to locate specific function/class definitions, variables, or error strings.\n"
+                        "  - Or specify focused line ranges using 'start_line' and 'end_line' (up to 1,000 lines)."
+                    )
+
+                context_status = (
+                    f"- Current Context Usage: {cur_tokens:,} / {max_tokens:,} tokens ({cur_pct:.1f}%)\n"
+                    if cur_tokens > 0 else
+                    f"- Context Limit: {max_tokens:,} tokens\n"
+                )
+
+                return (
+                    f"[Large File Read Notice - Confirmation Required]\n"
+                    f"File '{resolved}' is a large file ({total_lines:,} lines, {file_bytes:,} bytes).\n"
+                    f"- Estimated Token Consumption: ~{est_tokens:,} tokens (+{impact_pct:.1f}% of context limit)\n"
+                    f"{context_status}"
+                    f"{alt_advice}\n\n"
+                    f"If you genuinely need to read the entire file, call 'read_project_file' on '{resolved}' again (or pass confirm_full_read=True) to proceed and the full content will be displayed."
+                )
+
+            # Confirmed: clear pending confirmation for this file and proceed
+            _PENDING_FULL_READ_CONFIRMATIONS.discard(resolved_key)
 
         start = max(1, start_line) if start_line is not None else 1
         end = min(total_lines, end_line) if end_line is not None else total_lines
@@ -431,10 +503,19 @@ def read_project_file(
         if start > total_lines:
             return f"Error: start_line {start} exceeds total lines ({total_lines})."
 
-        # Cap line window if too wide
-        if end - start + 1 > 100:
-            end = start + 99
-            capped_note = f"\n[Range capped at 100 lines to preserve context budget. Use clangd_query for semantic symbols.]"
+        # Cap line window if wider than 1,000 lines
+        if end - start + 1 > 1000:
+            end = start + 999
+            if is_cpp_file:
+                capped_note = (
+                    f"\n[Range capped at 1,000 lines to preserve context budget. "
+                    f"Use 'clangd_query' for semantic symbols, or read subsequent lines with start_line={end + 1}, end_line={min(total_lines, end + 1000)}.]"
+                )
+            else:
+                capped_note = (
+                    f"\n[Range capped at 1,000 lines to preserve context budget. "
+                    f"Use 'ripgrep_search' to find symbols, or read subsequent lines with start_line={end + 1}, end_line={min(total_lines, end + 1000)}.]"
+                )
         else:
             capped_note = ""
 
@@ -569,7 +650,7 @@ def get_llm(
             return ChatOllama(
                 model=model_name,
                 base_url=ollama_host,
-                temperature=0.1,
+                temperature=0.0,
                 num_ctx=max_context_tokens,
             )
         except ImportError:
@@ -591,6 +672,78 @@ def get_llm(
             raise ImportError("langchain-google-genai is required. Run: pip install langchain-google-genai")
     else:
         raise ValueError(f"Unknown provider '{provider}'. Supported providers: 'ollama', 'gemini'.")
+
+
+def invoke_llm_with_retries(
+    llm,
+    messages: List[BaseMessage],
+    max_retries: int = 5,
+    base_delay: float = 6.0,
+    stage_name: str = "Agent Step"
+) -> BaseMessage:
+    """
+    Invoke an LLM (with bound tools or raw) with automatic error recovery and retries for:
+    1. HTTP 429 / RateLimit / ResourceExhausted errors (with exponential backoff and retry-in inspection).
+    2. Local Ollama tool-calling XML syntax errors (e.g. 'element <parameter> closed by </function>',
+       unclosed tags, or tool call parsing failures), injecting targeted formatting hints to prevent hangs.
+    """
+    call_messages = list(messages)
+    for attempt in range(1, max_retries + 1):
+        try:
+            return llm.invoke(call_messages)
+        except Exception as e:
+            err_msg = str(e)
+
+            # Check for Rate Limit (429)
+            if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
+                import re
+                match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
+                wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
+                console.print(f"[yellow]Rate limit reached (429). Waiting {wait_time:.1f}s (attempt {attempt}/{max_retries})...[/yellow]")
+                time.sleep(wait_time)
+                continue
+
+            # Check for Ollama XML syntax error / malformed tool call
+            is_tool_syntax_error = any(phrase in err_msg for phrase in [
+                "XML syntax error",
+                "closed by </function>",
+                "closed by </parameter>",
+                "tool call parsing failed",
+                "unclosed token",
+                "element <parameter>",
+                "element <function>",
+            ])
+            if is_tool_syntax_error and attempt < max_retries:
+                wait_time = 2.0
+                console.print(
+                    f"\n  [bold yellow][Warning] Model tool-call XML syntax glitch encountered:[/bold yellow]\n"
+                    f"  [dim]{err_msg[:160]}[/dim]\n"
+                    f"  [yellow]Injecting formatting guidance hint and retrying (attempt {attempt}/{max_retries})...[/yellow]\n"
+                )
+                time.sleep(wait_time)
+                corrective_hint = SystemMessage(
+                    content=(
+                        "════════════════════════════════════════════════════════════════════════════════\n"
+                        "[CRITICAL SYSTEM NOTICE - TOOL CALL SYNTAX RECOVERY]:\n"
+                        "Your previous tool invocation failed because Ollama encountered an XML syntax error:\n"
+                        f"{err_msg}\n\n"
+                        "MANDATORY XML FORMATTING RULES FOR THIS TURN:\n"
+                        "1. Ensure EVERY '<parameter name=\"...\">' tag is strictly closed with its matching '</parameter>' tag before closing '</function>'.\n"
+                        "2. Never close an open '<parameter>' tag directly with '</function>'.\n"
+                        "3. Do NOT output raw or unescaped angle brackets ('<' or '>') or markup tags inside parameter string values.\n"
+                        "Please re-generate the tool call now following these exact formatting rules.\n"
+                        "════════════════════════════════════════════════════════════════════════════════"
+                    )
+                )
+                call_messages = list(messages) + [corrective_hint]
+                continue
+
+            if is_tool_syntax_error:
+                raise RuntimeError(
+                    f"Ollama tool-call XML syntax error persisted after {max_retries} attempts: {err_msg}\n"
+                    "Tip: Upgrade Ollama to the latest release or use a model with robust function-calling support."
+                ) from e
+            raise e
 
 
 @tool
@@ -993,6 +1146,7 @@ __all__ = [
     "get_active_project_dir",
     "ensure_compile_commands",
     "get_llm",
+    "invoke_llm_with_retries",
     "extract_text",
     "extract_message_text",
     "discover_project_classes",
@@ -1006,6 +1160,10 @@ __all__ = [
     "set_require_permission",
     "get_require_permission",
     "set_permission_callback",
+    "set_current_context_stats",
+    "get_current_context_stats",
+    "clear_pending_full_reads",
+    "BIG_FILE_LINE_THRESHOLD",
     "ask_user_permission",
     "PermissionResult",
 ]

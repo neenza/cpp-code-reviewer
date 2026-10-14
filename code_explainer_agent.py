@@ -35,6 +35,7 @@ from cpp_agent_tools import (
     get_active_project_dir,
     ensure_compile_commands,
     get_llm,
+    invoke_llm_with_retries,
     extract_text,
     COMMON_CPP_TOOLS
 )
@@ -85,23 +86,13 @@ def build_explainer_graph(llm, tools=COMMON_CPP_TOOLS):
     llm_with_tools = llm.bind_tools(tools)
 
     def agent_step(state: MessagesState) -> Dict[str, Any]:
-        messages = state["messages"]
-        max_retries = 5
-        base_delay = 6
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = llm_with_tools.invoke(messages)
-                return {"messages": [response]}
-            except Exception as e:
-                err_msg = str(e)
-                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in err_msg) and attempt < max_retries:
-                    import re
-                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
-                    wait_time = (float(match.group(1)) + 2) if match else base_delay * (2 ** (attempt - 1))
-                    console.print(f"[yellow]Rate limit reached (429). Waiting {wait_time:.1f}s (attempt {attempt}/{max_retries})...[/yellow]")
-                    time.sleep(wait_time)
-                else:
-                    raise e
+        response = invoke_llm_with_retries(
+            llm=llm_with_tools,
+            messages=messages,
+            max_retries=5,
+            stage_name="Explainer Step"
+        )
+        return {"messages": [response]}
 
     tool_node = ToolNode(tools)
 
