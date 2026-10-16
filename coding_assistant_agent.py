@@ -49,6 +49,7 @@ from cpp_agent_tools import (
     set_require_permission,
     get_require_permission
 )
+from mcp_tool_adapter import build_mcp_tools
 
 load_dotenv()
 console = Console()
@@ -376,7 +377,12 @@ def run_interactive_assistant(
     summarize_threshold: int = 12000,
     max_steps: int = 60,
     auto_approve: bool = False,
-    system_prompt_file: Optional[str] = None
+    system_prompt_file: Optional[str] = None,
+    mcp_server_url: Optional[str] = None,
+    mcp_tools_info: Optional[str] = None,
+    mcp_api_key: Optional[str] = None,
+    mcp_headers: Optional[str] = None,
+    mcp_config: Optional[str] = None
 ) -> None:
     """Start an interactive coding assistant REPL session."""
     proj_path = Path(project_dir).resolve()
@@ -395,6 +401,25 @@ def run_interactive_assistant(
 
     prompt_source = f"File: {Path(system_prompt_file).name}" if system_prompt_file else "Default Engineering Principles"
 
+    # Load user-configured MCP tools if provided
+    mcp_tools: List[Any] = []
+    if mcp_config or mcp_server_url:
+        try:
+            mcp_tools = build_mcp_tools(
+                server_url=mcp_server_url,
+                tools_info=mcp_tools_info,
+                api_key=mcp_api_key,
+                headers=mcp_headers,
+                config_path=mcp_config
+            )
+            console.print(f"  [bold green][MCP][/bold green] Successfully connected. Loaded {len(mcp_tools)} MCP tool(s).")
+        except Exception as e:
+            console.print(f"  [bold red][MCP Error][/bold red] Failed to load MCP tools: {e}")
+
+    tools_summary = "clangd_query, ripgrep, read/write/edit_project_file, execute_shell_command"
+    if mcp_tools:
+        tools_summary += f" + {len(mcp_tools)} MCP tool(s) ({', '.join(t.name for t in mcp_tools)})"
+
     console.print(Panel(
         f"[bold cyan]C++ General Coding Assistant[/bold cyan]\n"
         f"Project Path    : [yellow]{proj_path}[/yellow]\n"
@@ -404,8 +429,8 @@ def run_interactive_assistant(
         f"Context Limit   : [magenta]{max_context_tokens:,} tokens[/magenta]\n"
         f"Summarize Limit : [magenta]{summarize_threshold:,} tokens[/magenta]\n"
         f"Permissions     : [yellow]{'Interactive Prompts' if not auto_approve else 'Auto-Approved (--yes)'}[/yellow]\n"
-        f"Tools Active    : [blue]clangd_query, ripgrep, read/write/edit_project_file, execute_shell_command[/blue]\n\n"
-        f"[dim]Type your requests or questions. Type 'exit' or 'quit' to end session.[/dim]",
+        f"Tools Active    : [blue]{tools_summary}[/blue]\n\n"
+        f"[dim]Type your requests or questions. Commands: /mcp list, /mcp add, /mcp clear, /help, exit.[/dim]",
         title="Session Initialized",
         border_style="cyan"
     ))
@@ -417,15 +442,32 @@ def run_interactive_assistant(
         max_context_tokens=max_context_tokens
     )
 
+    def _build_effective_prompt(base_prompt: str, tools_list: List[Any]) -> str:
+        if not tools_list:
+            return base_prompt
+        tool_names = ", ".join(t.name for t in tools_list)
+        return (
+            f"{base_prompt}\n"
+            f"════════════════════════════════════════════════════════════════════════════════\n"
+            f"USER-CONFIGURED MCP TOOLS:\n"
+            f"You are also equipped with the following custom MCP tools: {tool_names}.\n"
+            f"Use them whenever relevant to fulfill user directives.\n"
+            f"════════════════════════════════════════════════════════════════════════════════\n"
+        )
+
+    effective_prompt = _build_effective_prompt(system_prompt, mcp_tools)
+    all_active_tools = list(CODING_ASSISTANT_TOOLS) + list(mcp_tools)
+
     app = build_coding_assistant_graph(
         llm=llm,
+        tools=all_active_tools,
         max_context_tokens=max_context_tokens,
         summarize_threshold=summarize_threshold,
-        system_prompt=system_prompt
+        system_prompt=effective_prompt
     )
 
     conversation_messages: List[BaseMessage] = [
-        SystemMessage(content=system_prompt)
+        SystemMessage(content=effective_prompt)
     ]
 
     while True:
@@ -442,8 +484,77 @@ def run_interactive_assistant(
             console.print("[green]Goodbye![/green]")
             break
         if user_input.lower() == "clear":
-            conversation_messages = [SystemMessage(content=system_prompt)]
+            conversation_messages = [SystemMessage(content=effective_prompt)]
             console.print("[dim]Conversation history cleared.[/dim]")
+            continue
+
+        if user_input.startswith("/mcp"):
+            parts = user_input.split(maxsplit=2)
+            subcmd = parts[1].lower() if len(parts) > 1 else "list"
+            if subcmd == "list":
+                if not mcp_tools:
+                    console.print("  [yellow]No custom MCP tools are currently connected. Use '/mcp add' to connect an MCP server.[/yellow]")
+                else:
+                    console.print(f"\n  [bold cyan]Active MCP Tools ({len(mcp_tools)}):[/bold cyan]")
+                    for t in mcp_tools:
+                        console.print(f"  - [bold green]{escape(t.name)}[/bold green]: {escape(t.description)}")
+                continue
+            elif subcmd == "add":
+                try:
+                    console.print("\n  [bold cyan]── Connect Custom MCP Server ──[/bold cyan]")
+                    url_in = Prompt.ask("  [bold green]MCP Server URL[/bold green]").strip()
+                    if not url_in:
+                        console.print("  [yellow]Connection cancelled (empty URL).[/yellow]")
+                        continue
+                    tools_in = Prompt.ask("  [bold green]Tools Info (path to .json file, dir, or 'auto')[/bold green]", default="auto").strip()
+                    key_in = Prompt.ask("  [bold green]API Key / Token (optional, press Enter to skip)[/bold green]", default="").strip()
+                    new_tools = build_mcp_tools(
+                        server_url=url_in,
+                        tools_info=tools_in,
+                        api_key=key_in or None
+                    )
+                    mcp_tools.extend(new_tools)
+                    effective_prompt = _build_effective_prompt(system_prompt, mcp_tools)
+                    all_active_tools = list(CODING_ASSISTANT_TOOLS) + list(mcp_tools)
+                    app = build_coding_assistant_graph(
+                        llm=llm,
+                        tools=all_active_tools,
+                        max_context_tokens=max_context_tokens,
+                        summarize_threshold=summarize_threshold,
+                        system_prompt=effective_prompt
+                    )
+                    console.print(f"  [bold green]Successfully connected![/bold green] Added {len(new_tools)} MCP tool(s). (Total MCP tools: {len(mcp_tools)})\n")
+                except Exception as e:
+                    console.print(f"  [bold red]Failed to connect MCP server:[/bold red] {e}\n")
+                continue
+            elif subcmd in ("clear", "remove", "disconnect"):
+                mcp_tools.clear()
+                effective_prompt = system_prompt
+                all_active_tools = list(CODING_ASSISTANT_TOOLS)
+                app = build_coding_assistant_graph(
+                    llm=llm,
+                    tools=all_active_tools,
+                    max_context_tokens=max_context_tokens,
+                    summarize_threshold=summarize_threshold,
+                    system_prompt=effective_prompt
+                )
+                console.print("  [green]Disconnected all MCP tools. Restored standard C++ tools.[/green]")
+                continue
+            else:
+                console.print("  [dim]Usage: /mcp list | /mcp add | /mcp clear[/dim]")
+                continue
+
+        if user_input.lower() in ("/help", "help"):
+            console.print(Panel(
+                "[bold cyan]Available Commands:[/bold cyan]\n"
+                "- [green]/mcp list[/green]     : Display connected MCP tools and descriptions\n"
+                "- [green]/mcp add[/green]      : Interactively connect any custom MCP server\n"
+                "- [green]/mcp clear[/green]    : Disconnect all active MCP tools\n"
+                "- [green]clear[/green]         : Reset conversation context\n"
+                "- [green]exit / quit[/green]   : End session",
+                title="Help",
+                border_style="cyan"
+            ))
             continue
 
         conversation_messages.append(HumanMessage(content=user_input))
@@ -472,7 +583,12 @@ def run_oneshot_assistant(
     summarize_threshold: int = 12000,
     max_steps: int = 60,
     auto_approve: bool = False,
-    system_prompt_file: Optional[str] = None
+    system_prompt_file: Optional[str] = None,
+    mcp_server_url: Optional[str] = None,
+    mcp_tools_info: Optional[str] = None,
+    mcp_api_key: Optional[str] = None,
+    mcp_headers: Optional[str] = None,
+    mcp_config: Optional[str] = None
 ) -> str:
     """Execute a single-shot goal or instruction autonomously."""
     proj_path = Path(project_dir).resolve()
@@ -491,6 +607,33 @@ def run_oneshot_assistant(
 
     prompt_source = f"File: {Path(system_prompt_file).name}" if system_prompt_file else "Default Engineering Principles"
 
+    # Load user-configured MCP tools if provided
+    mcp_tools: List[Any] = []
+    if mcp_config or mcp_server_url:
+        try:
+            mcp_tools = build_mcp_tools(
+                server_url=mcp_server_url,
+                tools_info=mcp_tools_info,
+                api_key=mcp_api_key,
+                headers=mcp_headers,
+                config_path=mcp_config
+            )
+            console.print(f"  [bold green][MCP][/bold green] Successfully connected. Loaded {len(mcp_tools)} MCP tool(s).")
+        except Exception as e:
+            console.print(f"  [bold red][MCP Error][/bold red] Failed to load MCP tools: {e}")
+
+    effective_system_prompt = system_prompt
+    if mcp_tools:
+        tool_names = ", ".join(t.name for t in mcp_tools)
+        effective_system_prompt = (
+            f"{system_prompt}\n"
+            f"════════════════════════════════════════════════════════════════════════════════\n"
+            f"USER-CONFIGURED MCP TOOLS:\n"
+            f"You are also equipped with the following custom MCP tools: {tool_names}.\n"
+            f"Use them whenever relevant to fulfill user directives.\n"
+            f"════════════════════════════════════════════════════════════════════════════════\n"
+        )
+
     console.print(Panel(
         f"[bold cyan]C++ General Coding Assistant (Autonomous Task)[/bold cyan]\n"
         f"Project Path    : [yellow]{proj_path}[/yellow]\n"
@@ -498,6 +641,7 @@ def run_oneshot_assistant(
         f"Provider        : [green]{provider}[/green]\n"
         f"Model           : [green]{model_name}[/green]\n"
         f"System Prompt   : [green]{prompt_source}[/green]\n"
+        f"MCP Tools       : [blue]{len(mcp_tools)} active[/blue]\n"
         f"Permissions     : [yellow]{'Interactive Prompts' if not auto_approve else 'Auto-Approved (--yes)'}[/yellow]",
         title="Task Execution",
         border_style="cyan"
@@ -510,15 +654,18 @@ def run_oneshot_assistant(
         max_context_tokens=max_context_tokens
     )
 
+    all_active_tools = list(CODING_ASSISTANT_TOOLS) + list(mcp_tools)
+
     app = build_coding_assistant_graph(
         llm=llm,
+        tools=all_active_tools,
         max_context_tokens=max_context_tokens,
         summarize_threshold=summarize_threshold,
-        system_prompt=system_prompt
+        system_prompt=effective_system_prompt
     )
 
     initial_messages: List[BaseMessage] = [
-        SystemMessage(content=system_prompt),
+        SystemMessage(content=effective_system_prompt),
         HumanMessage(content=prompt)
     ]
 
@@ -606,6 +753,36 @@ def parse_args():
         action="store_true",
         help="Automatically grant permission for file writes, patches, and shell commands without prompting."
     )
+    parser.add_argument(
+        "--mcp-server-url",
+        type=str,
+        default=None,
+        help="URL of an external or local MCP server (HTTP POST JSON-RPC 2.0 endpoint)."
+    )
+    parser.add_argument(
+        "--mcp-tools",
+        type=str,
+        default=None,
+        help="Path to MCP tools JSON file, directory of schemas, or 'auto' to auto-discover via tools/list."
+    )
+    parser.add_argument(
+        "--mcp-api-key",
+        type=str,
+        default=None,
+        help="API key or auth token for the MCP server (sent in X-API-Key and Authorization headers)."
+    )
+    parser.add_argument(
+        "--mcp-headers",
+        type=str,
+        default=None,
+        help="JSON string of custom HTTP headers to send to the MCP server."
+    )
+    parser.add_argument(
+        "--mcp-config",
+        type=str,
+        default=None,
+        help="Path to an MCP configuration JSON file defining custom MCP servers."
+    )
     return parser.parse_args()
 
 
@@ -622,7 +799,12 @@ if __name__ == "__main__":
             summarize_threshold=args.context_summarize_threshold,
             max_steps=args.max_steps,
             auto_approve=args.auto_approve,
-            system_prompt_file=args.system_prompt_file
+            system_prompt_file=args.system_prompt_file,
+            mcp_server_url=args.mcp_server_url,
+            mcp_tools_info=args.mcp_tools,
+            mcp_api_key=args.mcp_api_key,
+            mcp_headers=args.mcp_headers,
+            mcp_config=args.mcp_config
         )
     else:
         run_interactive_assistant(
@@ -634,5 +816,10 @@ if __name__ == "__main__":
             summarize_threshold=args.context_summarize_threshold,
             max_steps=args.max_steps,
             auto_approve=args.auto_approve,
-            system_prompt_file=args.system_prompt_file
+            system_prompt_file=args.system_prompt_file,
+            mcp_server_url=args.mcp_server_url,
+            mcp_tools_info=args.mcp_tools,
+            mcp_api_key=args.mcp_api_key,
+            mcp_headers=args.mcp_headers,
+            mcp_config=args.mcp_config
         )
